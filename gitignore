@@ -1,0 +1,12 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Cache hasil dashboard (dibuat otomatis)
+cache_hasil/
+
+# Data (unduh sendiri dari UCI)
+*.xlsx
+*.csv
