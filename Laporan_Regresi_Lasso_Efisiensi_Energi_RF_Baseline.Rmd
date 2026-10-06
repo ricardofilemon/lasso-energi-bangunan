@@ -1,0 +1,1405 @@
+---
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: false
+    highlight: default
+    css: null
+    self_contained: true
+title: "Pemodelan Efisiensi Energi Bangunan Menggunakan Regresi Lasso"
+author: "Logis Arrahman Putra Venda (140720260019) & Ricardo Filemon Renaldy Saragih (140720260008)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+---
+
+```{=html}
+<style>
+body { font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; max-width: 900px; margin: 0 auto; padding: 20px; }
+h1, h2, h3 { margin-top: 20px; }
+table { border-collapse: collapse; width: 100%; }
+table th, table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+table th { background-color: #f2f2f2; }
+code { background-color: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+pre { background-color: #f4f4f4; padding: 10px; overflow-x: auto; }
+</style>
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.align = "center",
+  fig.width = 8, fig.height = 4.5, out.width = "100%",
+  comment = "#>"
+)
+
+# Fungsi bantu untuk menulis angka pada narasi (koma desimal)
+fmt  <- function(x, d = 3) format(round(x, d), nsmall = d, decimal.mark = ",", trim = TRUE)
+fmtp <- function(p) format(p, scientific = TRUE, digits = 3, decimal.mark = ",")
+lst  <- function(x) if (length(x) == 0) "tidak ada" else paste(x, collapse = ", ")
+```
+
+# Laporan Penerapan Regresi Lasso untuk Seleksi Variabel dan Penanganan Multikolinearitas Sempurna pada Data Energy Efficiency dengan Random Forest sebagai Model Baseline
+
+Oleh: Logis Arrahman Putra Venda (140720260019) dan Ricardo Filemon Renaldy Saragih (140720260008)
+
+# BAB I PENDAHULUAN
+
+## 1.1 Latar Belakang
+
+Sektor bangunan merupakan salah satu penyumbang terbesar konsumsi energi dunia, dan sistem pemanas, ventilasi, serta pendingin udara (*heating, ventilation, and air conditioning*/HVAC) menyerap porsi terbesar dari energi tersebut. Oleh karena itu, perancangan bangunan yang hemat energi menjadi salah satu cara paling efektif untuk menekan permintaan energi. Dalam perancangan tersebut, beban pemanasan (*heating load*, HL) dan beban pendinginan (*cooling load*, CL) perlu diestimasi agar kapasitas peralatan pemanas dan pendingin dapat ditentukan secara tepat (Tsanas & Xifara, 2012).
+
+Simulasi energi bangunan dapat memberikan estimasi yang andal, tetapi prosesnya memakan waktu dan menuntut keahlian pada perangkat lunak tertentu. Pendekatan statistika dan *machine learning* menawarkan alternatif yang lebih cepat karena setelah model dilatih, beban energi untuk berbagai kombinasi parameter desain dapat diestimasi dengan segera. Selain akurasi prediksi, pendekatan statistika juga memberi pemahaman kuantitatif mengenai faktor desain yang paling berpengaruh.
+
+Data *Energy Efficiency* (ENB2012) yang dikembangkan oleh Tsanas dan Xifara (2012) memuat 768 bangunan hasil simulasi dengan delapan parameter desain (X1 sampai X8) dan dua respons, yaitu beban pemanasan (Y1) dan beban pendinginan (Y2). Data ini memiliki karakteristik struktural yang menarik sekaligus bermasalah bagi regresi linear klasik. Luas permukaan (X2), luas dinding (X3), dan luas atap (X4) terikat oleh hubungan geometri yang eksak ($X_2 = X_3 + 2X_4$), sehingga terjadi multikolinearitas sempurna. Selain itu, kompaknya relatif (X1) dan tinggi keseluruhan (X5) berkorelasi sangat kuat dengan variabel luas.
+
+Pada kondisi multikolinearitas sempurna, matriks $X^\top X$ bersifat singular sehingga penduga kuadrat terkecil biasa (*ordinary least squares*, OLS) tidak memiliki solusi tunggal. Regresi Lasso (*Least Absolute Shrinkage and Selection Operator*) yang diperkenalkan oleh Tibshirani (1996) menambahkan penalti $\ell_1$ pada koefisien sehingga masalah optimasi tetap terdefinisi, koefisien menyusut, dan koefisien variabel yang kurang informatif dapat menjadi tepat nol. Dengan demikian, Lasso menangani multikolinearitas dan melakukan seleksi variabel dalam satu prosedur.
+
+Namun, Lasso tetap merupakan model linear, sehingga kualitas prediksinya perlu diukur terhadap suatu acuan. Laporan ini menetapkan ***Random Forest* (RF) sebagai model baseline**. Pemilihan RF mengikuti Tsanas dan Xifara (2012) yang melaporkan bahwa RF jauh lebih akurat daripada regresi linear robust pada data yang sama. RF juga tidak mensyaratkan kelinearan, tidak terganggu oleh multikolinearitas, dan menangkap ketaklinearan serta interaksi antarprediktor secara otomatis, sehingga cocok menjadi acuan akurasi prediktif. Regresi Lasso dan regresi linear (OLS) kemudian dibandingkan terhadap baseline RF ini, sedangkan Lasso tetap dipakai sebagai model utama untuk seleksi variabel dan interpretasi. Seluruh analisis dikerjakan menggunakan bahasa pemrograman R.
+
+## 1.2 Rumusan Masalah
+
+Berdasarkan latar belakang tersebut, rumusan masalah dalam laporan ini adalah sebagai berikut.
+
+1.  Bagaimana kualitas dan karakteristik data *Energy Efficiency*, termasuk distribusi respons dan pola hubungan prediktor dengan respons?
+2.  Seberapa parah masalah multikolinearitas dan bagaimana hasil diagnostik model OLS (rank matriks desain, *condition number*, VIF, homoskedastisitas, normalitas residual, dan observasi berpengaruh)?
+3.  Variabel prediktor apa saja yang terpilih dan tereliminasi oleh regresi Lasso untuk masing-masing respons (Y1 dan Y2), dan seberapa stabil seleksi tersebut pada validasi silang berulang?
+4.  Seberapa baik kinerja prediksi regresi Lasso dan OLS dibandingkan dengan baseline *Random Forest*, baik pada data uji maupun pada validasi silang berulang, dan apa implikasinya terhadap ketaklinearan pada data?
+
+## 1.3 Tujuan Penelitian
+
+Tujuan penelitian ini adalah:
+
+1.  mendeskripsikan kualitas data, distribusi respons, dan pola hubungan antarvariabel pada data *Energy Efficiency*;
+2.  mendiagnosis multikolinearitas dan kelayakan model OLS pada data tersebut;
+3.  menerapkan regresi Lasso dengan parameter regularisasi hasil validasi silang untuk seleksi variabel dan menilai stabilitas seleksinya;
+4.  membangun *Random Forest* sebagai model baseline dan membandingkan kinerja prediksi Lasso dan OLS terhadap baseline tersebut.
+
+## 1.4 Manfaat Penelitian
+
+Secara praktis, hasil penelitian ini memberikan gambaran parameter desain bangunan yang paling berkontribusi terhadap beban pemanasan dan pendinginan, sehingga dapat menjadi acuan bagi perancang bangunan. Secara metodologis, laporan ini mendokumentasikan alur analisis yang lengkap dan dapat direproduksi, mulai dari eksplorasi data, diagnostik model, regresi Lasso pada data yang mengandung multikolinearitas sempurna, hingga pembandingan dengan model baseline *Random Forest*.
+
+## 1.5 Batasan Penelitian
+
+Penelitian ini menggunakan data simulasi Ecotect untuk bangunan hunian dengan volume tetap dan lokasi simulasi di Athena, Yunani, sehingga generalisasi ke kondisi bangunan atau iklim lain perlu dilakukan dengan hati-hati. Model Lasso yang dibangun adalah model linear dengan penalti $\ell_1$ (tanpa interaksi maupun suku nonlinear). Evaluasi dilakukan dengan satu kali pembagian data latih dan data uji (80:20) serta validasi silang 10-lipat dengan 5 pengulangan. Nilai koefisien Lasso yang tidak nol dibaca sebagai "terpilih oleh model", bukan sebagai "signifikan secara statistik". Y1 dan Y2 dimodelkan secara terpisah, dan Y1 tidak dipakai untuk memprediksi Y2 (maupun sebaliknya).
+
+# BAB II TINJAUAN PUSTAKA
+
+## 2.1 Kinerja Energi Bangunan
+
+Kinerja energi bangunan (*energy performance of buildings*, EPB) dipengaruhi oleh karakteristik bangunan, kondisi iklim, dan penggunaan ruang. Berbagai metode telah digunakan untuk memprediksi kebutuhan energi bangunan, di antaranya regresi polinomial, *support vector machine*, jaringan saraf tiruan, dan pohon keputusan. Tsanas dan Xifara (2012) mencatat bahwa banyak studi EPB mengandalkan korelasi linear dan regresi kuadrat terkecil klasik yang kurang sesuai ketika asumsi normalitas tidak terpenuhi, sedangkan studi lain memakai metode kompleks tanpa mengeksplorasi data secara memadai.
+
+## 2.2 Penelitian Baseline: Tsanas dan Xifara (2012)
+
+Tsanas dan Xifara (2012) membangun 768 bangunan simulasi menggunakan Ecotect. Setiap bangunan tersusun atas 18 kubus elementer berukuran $3{,}5 \times 3{,}5 \times 3{,}5$ dengan volume tetap 771,75 m$^3$. Terdapat 12 bentuk bangunan, tiga tingkat luas kaca (10%, 25%, 40%) dengan lima skenario distribusi, dan empat orientasi, ditambah bangunan tanpa kaca, sehingga total observasi adalah $12 \times 3 \times 5 \times 4 + 12 \times 4 = 768$. Simulasi mengasumsikan bangunan hunian di Athena dengan tujuh penghuni beraktivitas sedentari.
+
+Delapan variabel masukan dan dua variabel keluaran pada penelitian tersebut ditunjukkan pada Tabel 2.1.
+
+| Kode | Variabel | Jumlah nilai unik (paper) |
+|:---|:---|:--:|
+| X1 | *Relative compactness* (kekompakan relatif) | 12 |
+| X2 | *Surface area* (luas permukaan) | 12 |
+| X3 | *Wall area* (luas dinding) | 7 |
+| X4 | *Roof area* (luas atap) | 4 |
+| X5 | *Overall height* (tinggi keseluruhan) | 2 |
+| X6 | *Orientation* (orientasi) | 4 |
+| X7 | *Glazing area* (luas kaca) | 4 |
+| X8 | *Glazing area distribution* (distribusi luas kaca) | 6 |
+| Y1 (y1) | *Heating load* (beban pemanasan) | 586 |
+| Y2 (y2) | *Cooling load* (beban pendinginan) | 636 |
+
+: Variabel pada data ENB2012 (Tsanas & Xifara, 2012)
+
+Tsanas dan Xifara (2012) mengeksplorasi asosiasi variabel menggunakan koefisien korelasi peringkat Spearman dan informasi mutual (*mutual information*, MI). Hasilnya, X1 sampai X5 dan X7 berasosiasi kuat dan signifikan pada taraf 0,01 dengan HL, sedangkan X6 dan X8 tidak signifikan. Selain itu, ditemukan bahwa X1 dan X2 berbanding terbalik karena volume dibuat konstan, dan X4 dengan X5 hampir berbanding terbalik.
+
+Dua pembelajar (*learner*) dibandingkan menggunakan validasi silang 10-lipat dengan 100 kali pengulangan, yaitu regresi linear robust *iteratively reweighted least squares* (IRLS) dan *random forest* (RF). Galat luar-sampel (*out-of-sample*) yang dilaporkan disajikan pada Tabel 2.2.
+
+| Ukuran galat | Respons |     IRLS     | *Random forest* |
+|:-------------|:-------:|:------------:|:---------------:|
+| MAE          | y1 (HL) | 2,14 ± 0,24  |   0,51 ± 0,11   |
+| MAE          | y2 (CL) | 2,21 ± 0,28  |   1,42 ± 0,25   |
+| MSE          | y1 (HL) | 9,87 ± 2,41  |   1,03 ± 0,54   |
+| MSE          | y2 (CL) | 11,46 ± 3,63 |   6,59 ± 1,56   |
+
+: Galat luar-sampel baseline (Tsanas & Xifara, 2012)
+
+Penelitian tersebut menyimpulkan bahwa RF jauh lebih akurat daripada IRLS, dan peubah yang paling penting menurut RF adalah luas kaca (X7). Penulis juga mengingatkan bahwa regresi klasik dapat gagal menangani multikolinearitas, yaitu koefisien tampak besar dengan tanda berlawanan, serta menyarankan kehati-hatian dalam menafsirkan koefisien regresi linear pada kondisi kolinear. Dua temuan ini menjadi dasar laporan ini, yaitu (i) RF ditetapkan sebagai model baseline karena terbukti menjadi pembelajar terbaik pada data yang sama, dan (ii) regresi Lasso diterapkan untuk mengatasi keterbatasan model linear pada kondisi kolinear.
+
+## 2.3 Regresi Linear dan Diagnostik Model
+
+Model regresi linear berganda dituliskan sebagai $y = X\beta + \varepsilon$ dengan $\varepsilon \sim (0, \sigma^2 I)$. Penduga OLS $\hat{\beta} = (X^\top X)^{-1}X^\top y$ mensyaratkan $X^\top X$ dapat dibalik. Diagnostik yang dilakukan pada model OLS dalam laporan ini adalah sebagai berikut.
+
+1.  Rank dan *condition number* matriks desain. Matriks desain dengan intersep dikatakan *rank deficient* apabila rank-nya lebih kecil daripada jumlah kolom, yang berarti terdapat ketergantungan linear sempurna. *Condition number* yang sangat besar menandakan matriks hampir singular (Belsley et al., 1980).
+2.  *Variance inflation factor* (VIF), $VIF_j = 1/(1 - R_j^2)$, dengan $R_j^2$ adalah koefisien determinasi dari regresi prediktor ke-$j$ terhadap prediktor lainnya. Nilai VIF di atas 10 umumnya dianggap mengindikasikan multikolinearitas serius (Kutner et al., 2005).
+3.  Homoskedastisitas, diuji dengan *Breusch-Pagan* (Breusch & Pagan, 1979) dalam versi *studentized* (Koenker, 1981). Hipotesis nol menyatakan ragam galat konstan.
+4.  Normalitas residual, diuji dengan *Jarque-Bera* (Jarque & Bera, 1980) yang berbasis kemencengan dan kurtosis residual. Hipotesis nol menyatakan residual berdistribusi normal.
+5.  Observasi berpengaruh, diperiksa dengan jarak Cook (Cook, 1977) dengan ambang $4/n$, serta plot residual terhadap nilai *fitted* dan *Q-Q plot* residual.
+
+Karena terdapat multikolinearitas sempurna, inferensi klasik OLS (uji-t dan *p-value* koefisien) tidak dipakai untuk menyatakan suatu variabel "benar-benar penting". Diagnostik OLS diperlakukan sebagai alat untuk memahami kondisi data, sedangkan penilaian model dilakukan melalui kinerja prediksi di luar sampel.
+
+## 2.4 Multikolinearitas dan Regularisasi
+
+Multikolinearitas terjadi ketika sebagian prediktor dapat dinyatakan sebagai kombinasi linear prediktor lain. Pada multikolinearitas tidak sempurna, ragam penduga OLS membengkak dan koefisien menjadi tidak stabil. Pada multikolinearitas sempurna, $X^\top X$ singular sehingga penduga OLS tidak terdefinisi secara tunggal. Regularisasi mengatasi masalah ini dengan menambahkan penalti pada besar koefisien. Regresi *ridge* (Hoerl & Kennard, 1970) menggunakan penalti $\ell_2$ yang menyusutkan koefisien tanpa menghilangkannya, sedangkan Lasso menggunakan penalti $\ell_1$.
+
+## 2.5 Regresi Lasso
+
+Penduga Lasso (Tibshirani, 1996; Hastie et al., 2009) diperoleh dari
+
+$$\hat{\beta}^{\text{lasso}} = \underset{\beta_0,\beta}{\arg\min}\; \frac{1}{2n}\sum_{i=1}^{n}\left(y_i - \beta_0 - x_i^\top\beta\right)^2 + \lambda\sum_{j=1}^{p}\left|\beta_j\right|,$$
+
+dengan $\lambda \ge 0$ (disebut `lambda` pada paket glmnet dan disebut *alpha* pada beberapa laporan) adalah parameter regularisasi. Semakin besar $\lambda$, semakin banyak koefisien yang menyusut hingga tepat nol. Karena penalti $\ell_1$ bersifat tidak dapat diturunkan di titik nol, sebagian koefisien dapat bernilai nol persis sehingga Lasso berfungsi sebagai metode seleksi variabel. Fungsi objektif Lasso bersifat konveks sehingga selalu memiliki solusi, meskipun $X^\top X$ singular. Penalti bersifat sensitif terhadap skala peubah, sehingga prediktor numerik dibakukan sebelum pemodelan. Pada sekelompok prediktor yang saling berkorelasi tinggi, Lasso cenderung memilih satu atau sebagian saja dari kelompok tersebut (Zou & Hastie, 2005), sehingga pemilihan peubah pada kondisi kolinear perlu ditafsirkan sebagai pemilihan perwakilan informasi, bukan pembuktian bahwa peubah lain tidak berpengaruh.
+
+Nilai $\lambda$ dipilih melalui validasi silang $K$-lipat, yaitu $\lambda$ yang meminimumkan rata-rata galat kuadrat prediksi pada lipatan validasi (`lambda.min`). Algoritme yang lazim digunakan untuk menghitung solusinya adalah *coordinate descent* (Friedman et al., 2010) yang diimplementasikan pada paket glmnet di R.
+
+## 2.6 Random Forest sebagai Model Baseline
+
+*Random forest* (Breiman, 2001) adalah kumpulan pohon keputusan yang dilatih pada sampel *bootstrap* data latih. Pada setiap pemisahan simpul, hanya sebagian prediktor yang dipilih acak (`mtry`) yang dipertimbangkan, dan prediksi akhir untuk regresi adalah rerata prediksi seluruh pohon. Karena bersifat nonparametrik, RF tidak mensyaratkan bentuk fungsional linear, tidak memerlukan asumsi distribusi galat, dan dapat menangkap ketaklinearan serta interaksi antarprediktor. RF juga tidak terganggu oleh multikolinearitas dari sisi prediksi, sehingga hubungan $X_2 = X_3 + 2X_4$ tidak menjadi masalah pada pemodelannya.
+
+Dua hiperparameter yang di-*tuning* pada laporan ini adalah `mtry` (jumlah prediktor acak pada tiap pemisahan) dan `min.node.size` (ukuran minimum simpul daun). Setiap kombinasi dievaluasi dengan galat *out-of-bag* (OOB), yaitu galat prediksi pada observasi yang tidak terambil dalam sampel *bootstrap* suatu pohon, sehingga pemilihan hiperparameter tidak memerlukan data validasi terpisah. Implementasi menggunakan paket ranger (Wright & Ziegler, 2017).
+
+Kontribusi prediktif tiap variabel dinilai dengan *permutation importance*, yaitu kenaikan galat OOB ketika nilai satu variabel diacak. Ukuran ini menunjukkan seberapa besar variabel dipakai untuk prediksi, dan bukan bukti signifikansi statistik maupun hubungan kausal. Pada prediktor yang saling berkorelasi kuat, importance dapat terbagi di antara variabel-variabel tersebut sehingga importance yang rendah tidak berarti variabel tersebut tidak berpengaruh.
+
+Pada laporan ini RF berperan sebagai **model baseline**, yaitu acuan akurasi prediktif nonlinear. Model linear (OLS dan Lasso) dinilai dari seberapa dekat kinerjanya terhadap baseline ini. Selisih yang besar menandakan adanya struktur nonlinear atau interaksi yang tidak tertangkap oleh model linear.
+
+## 2.7 Ukuran Evaluasi dan Validasi Model
+
+Kinerja prediksi dievaluasi dengan tiga ukuran berikut.
+
+$$\text{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2},\qquad
+\text{MAE} = \frac{1}{n}\sum_{i=1}^{n}|y_i-\hat{y}_i|,\qquad
+R^2 = 1-\frac{\sum_{i}(y_i-\hat{y}_i)^2}{\sum_{i}(y_i-\bar{y})^2}.$$
+
+Ukuran tersebut dihitung pada data uji (satu kali pembagian 80:20) dan pada validasi silang berulang (10-lipat dengan 5 pengulangan, sehingga terdapat 50 lipatan luar). Ringkasan hasil validasi silang disajikan sebagai rerata, simpangan baku, dan interval empiris 2,5% sampai 97,5% dari hasil resampling. Interval empiris ini bukan selang kepercayaan inferensial klasik karena lipatan pada validasi silang berulang saling bergantung.
+
+# BAB III METODE PENELITIAN
+
+## 3.1 Data dan Variabel Penelitian
+
+Data yang digunakan adalah *Energy Efficiency Dataset* (ENB2012) yang terdiri atas 768 observasi dan 10 variabel, yaitu delapan prediktor (X1 sampai X8) dan dua respons (Y1 dan Y2), seperti pada Tabel 2.1. Unit data adalah konfigurasi desain bangunan hasil simulasi Ecotect. Variabel X6 (orientasi) dan X8 (distribusi luas kaca) memiliki sedikit nilai diskret yang merupakan kode kategori, sehingga keduanya diperlakukan sebagai variabel kategorik. Prediktor numerik adalah X1, X2, X3, X4, X5, dan X7.
+
+Untuk model linear (OLS dan Lasso), prediktor numerik dibakukan (rerata 0 dan simpangan baku populasi 1) dan X6 serta X8 dikonversi menjadi variabel *dummy* dengan kategori pertama sebagai referensi, sehingga terdapat 14 kolom prediktor (6 numerik, 3 *dummy* X6, dan 5 *dummy* X8). Untuk model baseline RF, delapan prediktor asli dipakai langsung dengan X6 dan X8 sebagai faktor. Hubungan $X_2 = X_3 + 2X_4$ sengaja dipertahankan sebagai masalah multikolinearitas dan bukan alasan menghapus X2 sebelum Lasso.
+
+## 3.2 Tahapan Analisis
+
+Analisis dilakukan melalui tahapan berikut.
+
+1.  Rumusan pertanyaan: variabel desain manakah, di antara X1 sampai X8, yang tetap terpilih oleh Lasso saat memprediksi Y1 dan Y2 secara terpisah.
+2.  EDA terarah: pemeriksaan kualitas data, distribusi Y1 dan Y2, korelasi peringkat Spearman, kurva LOWESS untuk X7, dan perbandingan sebaran respons antarkategori X6 dan X8.
+3.  Pembagian data dan penyusunan model: membagi data secara acak menjadi 80% data latih dan 20% data uji dengan `set.seed(42)`, mempelajari pembakuan dan pengkodean hanya dari data latih, lalu menyesuaikan regresi linear (OLS) dan Lasso untuk Y1 dan Y2 secara terpisah.
+4.  Diagnostik model: rank, *condition number*, VIF, uji Breusch-Pagan, uji Jarque-Bera, jarak Cook, plot residual, dan *Q-Q plot* pada model OLS.
+5.  Evaluasi model linear: RMSE, MAE, dan $R^2$ pada data uji dan pada validasi silang berulang (10-lipat $\times$ 5 pengulangan), serta stabilitas seleksi variabel Lasso pada 50 lipatan luar.
+6.  Model baseline *Random Forest*: *tuning* hiperparameter dengan galat OOB, evaluasi pada data uji dan pada lipatan validasi silang yang sama dengan model linear, perbandingan berpasangan Lasso terhadap RF per lipatan, serta *permutation importance*.
+7.  Interpretasi dan kesimpulan: membandingkan seleksi Lasso dengan importance RF dan menyusun ringkasan perbandingan model.
+
+## 3.3 Model Baseline dan Model Pembanding
+
+**Baseline: *Random Forest*.** Model RF dibangun dengan paket ranger menggunakan 500 pohon. Hiperparameter dipilih dari kisi 12 kombinasi, yaitu `mtry` $\in \{2, 4, 6, 8\}$ dan `min.node.size` $\in \{1, 5, 10\}$, dengan kriteria RMSE OOB terkecil. Model terbaik dilatih ulang dengan *permutation importance*. Pada validasi silang berulang, hiperparameter dipilih ulang di setiap lipatan latih luar sehingga lipatan validasi tidak dipakai untuk *tuning*.
+
+**Pembanding 1: regresi linear (OLS).** OLS disesuaikan pada matriks desain terbakukan dengan `lm`. Karena matriks desain *rank deficient*, `lm` memberi nilai `NA` pada koefisien yang teralias, tetapi nilai prediksinya tetap valid. Pada kode, objek OLS ini bernama `baseline` mengikuti penamaan awal skrip; dalam laporan ini OLS diposisikan sebagai pembanding linear dan diagnostik, sedangkan baseline prediktif utama adalah RF.
+
+**Pembanding 2: Lasso.** Lasso disesuaikan dengan glmnet (`alpha = 1`, `standardize = FALSE`) pada kisi 200 nilai $\lambda$ dari $10^{2}$ sampai $10^{-4}$. Nilai $\lambda$ dipilih dengan validasi silang dalam 5-lipat yang meminimumkan MSE (`lambda.min`). Dengan `standardize = FALSE`, fungsi objektif glmnet adalah $\frac{1}{2n}\text{RSS} + \lambda\|\beta\|_1$ pada prediktor yang telah dibakukan secara manual.
+
+**Skema validasi.** Ketiga model dievaluasi pada data uji yang sama dan pada partisi lipatan luar yang identik (`set.seed(42 + ulangan)`), sehingga selisih kinerja dapat dibandingkan secara berpasangan per lipatan.
+
+## 3.4 Perangkat Lunak
+
+Seluruh analisis menggunakan R (`r R.version.string`). Paket yang dipakai adalah tidyverse (manipulasi data, visualisasi ggplot2, dan iterasi purrr), readxl (impor data), glmnet (regresi Lasso dan validasi silang), lmtest (uji Breusch-Pagan), patchwork (penggabungan grafik), dan ranger (*Random Forest*). Kode analisis dijalankan berurutan sesuai skrip analisis dan seluruh angka pada narasi dihitung langsung dari hasil eksekusi kode.
+
+# BAB IV HASIL DAN PEMBAHASAN
+
+## 4.1 Persiapan Data
+
+### 4.1.1 Import Library
+
+```{r libraries}
+# Persiapan Library dan Data --------------------------------------------------
+
+# Jalankan SEKALI saja jika paket belum terpasang:
+# install.packages(c("tidyverse", "readxl", "glmnet", "lmtest", "patchwork"))
+
+suppressPackageStartupMessages({
+  library(tidyverse)   # dplyr, tidyr, ggplot2, purrr, tibble
+  library(readxl)      # membaca file .xlsx
+  library(glmnet)      # Lasso (pengganti LassoCV sklearn)
+  library(lmtest)      # uji Breusch-Pagan
+  library(patchwork)   # menggabungkan beberapa grafik ggplot
+})
+
+theme_set(theme_bw(base_size = 12))
+options(width = 160, tibble.width = Inf, tibble.print_max = Inf)
+```
+
+Paket ranger dimuat pada tahap awal ini (pada skrip aslinya dimuat sebelum Langkah 7) agar kegagalan pemasangan paket terdeteksi sebelum proses validasi silang yang panjang dijalankan.
+
+```{r library-ranger}
+# Persiapan Library -----------------------------------------------------------
+# Jalankan SEKALI jika paket belum terpasang:
+# install.packages("ranger")
+
+suppressPackageStartupMessages({
+  library(ranger)      # implementasi Random Forest yang cepat
+})
+```
+
+### 4.1.2 Membaca Data
+
+```{r read-data}
+# Gunakan garis miring "/" (atau "\\") pada path Windows di R
+FILE_PATH <- "C:/Users/USER/Downloads/Energy Efficiency.xlsx"
+df <- read_excel(FILE_PATH, sheet = 1)
+
+cat("Shape:", nrow(df), "x", ncol(df), "\n")
+print(head(df))
+```
+
+### 4.1.3 Pendefinisian Variabel
+
+```{r define-variables}
+# Definisi Variabel -----------------------------------------------------------
+
+FEATURES             <- c("X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8")
+TARGETS              <- c("Y1", "Y2")
+NUMERIC_FEATURES     <- c("X1", "X2", "X3", "X4", "X5", "X7")
+CATEGORICAL_FEATURES <- c("X6", "X8")
+
+variable_info <- tibble(
+  Variable = c(FEATURES, TARGETS),
+  Description = c(
+    "Relative Compactness", "Surface Area", "Wall Area", "Roof Area",
+    "Overall Height", "Orientation", "Glazing Area", "Glazing Area Distribution",
+    "Heating Load", "Cooling Load"
+  ),
+  Role = c(rep("Predictor", 8), rep("Response", 2))
+)
+print(variable_info)
+```
+
+Data terdiri atas delapan variabel prediktor dan dua variabel respons dengan `r nrow(df)` observasi. Variabel Y1 adalah beban pemanasan dan Y2 adalah beban pendinginan. Variabel X6 (orientasi) dan X8 (distribusi luas kaca) adalah kode kategori sehingga diperlakukan sebagai variabel kategorik, sedangkan X1, X2, X3, X4, X5, dan X7 diperlakukan sebagai variabel numerik.
+
+## 4.2 EDA Terarah
+
+### 4.2.1 Kualitas Data dan Statistika Deskriptif
+
+```{r eda-quality}
+## Kualitas data ----
+vars <- c(FEATURES, TARGETS)
+
+quality <- tibble(
+  Variable = vars,
+  dtype    = vapply(df[vars], function(x) class(x)[1], character(1), USE.NAMES = FALSE),
+  missing  = vapply(df[vars], function(x) sum(is.na(x)), numeric(1), USE.NAMES = FALSE),
+  n_unique = vapply(df[vars], function(x) n_distinct(x), numeric(1), USE.NAMES = FALSE)
+)
+print(quality)
+
+cat("Duplicate rows:", sum(duplicated(df)), "\n")
+
+# Ringkasan statistik (setara df.describe().T di pandas)
+describe_tbl <- function(data) {
+  q <- function(p) vapply(data, function(x) quantile(x, p, na.rm = TRUE, names = FALSE), numeric(1), USE.NAMES = FALSE)
+  tibble(
+    Variable = names(data),
+    count    = vapply(data, function(x) sum(!is.na(x)), numeric(1), USE.NAMES = FALSE),
+    mean     = vapply(data, mean, numeric(1), na.rm = TRUE, USE.NAMES = FALSE),
+    std      = vapply(data, sd,   numeric(1), na.rm = TRUE, USE.NAMES = FALSE),
+    min      = vapply(data, min,  numeric(1), na.rm = TRUE, USE.NAMES = FALSE),
+    `25%`    = q(0.25),
+    `50%`    = q(0.50),
+    `75%`    = q(0.75),
+    max      = vapply(data, max,  numeric(1), na.rm = TRUE, USE.NAMES = FALSE)
+  )
+}
+print(describe_tbl(df[vars]))
+```
+
+```{r narasi-quality, include=FALSE}
+n_unique_x <- quality$n_unique[quality$Variable %in% FEATURES]
+n_unique_y <- quality$n_unique[quality$Variable %in% TARGETS]
+```
+
+Dataset terdiri atas `r nrow(df)` observasi dengan `r sum(quality$missing)` nilai hilang pada seluruh variabel yang dianalisis dan `r sum(duplicated(df))` baris duplikat, sehingga tidak diperlukan imputasi maupun penghapusan baris. Jumlah nilai unik pada X1 sampai X8 sangat sedikit (`r min(n_unique_x)` sampai `r max(n_unique_x)` nilai), sedangkan Y1 memiliki `r n_unique_y[1]` nilai unik dan Y2 memiliki `r n_unique_y[2]` nilai unik. Hal ini sesuai dengan rancangan data hasil simulasi, yaitu prediktor merupakan parameter desain yang bersifat diskret, sedangkan respons berupa besaran kontinu. Jumlah nilai unik yang kecil pada X5, X6, dan X8 juga mendasari keputusan untuk memperlakukan X6 dan X8 sebagai variabel kategorik.
+
+### 4.2.2 Hubungan Struktural X2, X3, dan X4
+
+```{r eda-dependency}
+## Hubungan struktural X2, X3, dan X4 ----
+# X2 = X3 + 2*X4 -> multikolinearitas sempurna pada regresi linear tanpa penalti.
+dependency <- df$X2 - (df$X3 + 2 * df$X4)
+cat("Maximum absolute difference X2 - (X3 + 2*X4):", max(abs(dependency)), "\n")
+```
+
+Selisih absolut maksimum antara X2 dan $(X_3 + 2X_4)$ adalah `r ifelse(max(abs(dependency)) == 0, "0", fmtp(max(abs(dependency))))`, sehingga identitas $X_2 = X_3 + 2X_4$ berlaku pada seluruh observasi (selisih hanya berasal dari galat numerik komputer). Dengan kata lain, ketiga variabel ini saling bergantung secara linear sempurna dan akan menimbulkan masalah pada regresi linear tanpa penalti.
+
+### 4.2.3 Distribusi Y1 dan Y2
+
+```{r eda-dist, fig.height=7}
+## Distribusi Y1 dan Y2 ----
+plot_dist <- function(target) {
+  p1 <- ggplot(df, aes(x = .data[[target]])) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30,
+                   fill = "steelblue", alpha = 0.6, color = "white") +
+    geom_density(linewidth = 1) +
+    labs(title = paste("Distribution of", target), x = target, y = "Density")
+  
+  p2 <- ggplot(df, aes(x = .data[[target]])) +
+    geom_boxplot(fill = "steelblue", alpha = 0.6) +
+    labs(title = paste("Boxplot of", target), x = target) +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  
+  p1 | p2
+}
+print(plot_dist("Y1") / plot_dist("Y2"))
+print(describe_tbl(df[TARGETS]))
+```
+
+```{r narasi-resp, include=FALSE}
+resp_desc <- describe_tbl(df[TARGETS])
+med_y1 <- resp_desc$`50%`[1]; med_y2 <- resp_desc$`50%`[2]
+```
+
+Rerata beban pemanasan (Y1) adalah `r fmt(resp_desc$mean[1], 2)` dengan median `r fmt(med_y1, 2)` dan simpangan baku `r fmt(resp_desc$std[1], 2)`, sedangkan rerata beban pendinginan (Y2) adalah `r fmt(resp_desc$mean[2], 2)` dengan median `r fmt(med_y2, 2)` dan simpangan baku `r fmt(resp_desc$std[2], 2)`. Histogram kedua respons tidak berbentuk lonceng tunggal, dengan kepadatan yang terkonsentrasi pada lebih dari satu wilayah nilai, sehingga sebaran respons tidak mendekati normal. *Boxplot* memperlihatkan sebaran dan letak pencilan (jika ada) pada masing-masing respons. Temuan ini konsisten dengan pengamatan Tsanas dan Xifara (2012) yang menyatakan data bersifat non-Gaussian.
+
+### 4.2.4 Korelasi Peringkat Spearman
+
+```{r eda-spearman, fig.height=6}
+## Korelasi rank Spearman ----
+# Korelasi kecil tidak berarti prediktor tidak penting jika hubungannya non-linear.
+spearman_cols <- c("X1", "X2", "X3", "X4", "X5", "X7", "Y1", "Y2")
+spearman_corr <- cor(df[spearman_cols], method = "spearman")
+
+spearman_long <- as.data.frame(as.table(spearman_corr)) %>%
+  setNames(c("Var1", "Var2", "rho"))
+
+p_heat <- ggplot(spearman_long, aes(x = Var1, y = Var2, fill = rho)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", rho)), size = 3.5) +
+  scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#B40426",
+                       midpoint = 0, limits = c(-1, 1)) +
+  scale_x_discrete(limits = spearman_cols) +
+  scale_y_discrete(limits = rev(spearman_cols)) +
+  coord_fixed() +
+  labs(title = "Spearman Rank Correlation", x = NULL, y = NULL)
+print(p_heat)
+
+print(round(spearman_corr[c("X1", "X2", "X3", "X4", "X5", "X7"), c("Y1", "Y2")], 4))
+```
+
+```{r narasi-spearman, include=FALSE}
+num_x  <- c("X1", "X2", "X3", "X4", "X5", "X7")
+rho_y1 <- spearman_corr[num_x, "Y1"]
+rho_y2 <- spearman_corr[num_x, "Y2"]
+top_y1 <- names(which.max(abs(rho_y1)))
+top_y2 <- names(which.max(abs(rho_y2)))
+Xc <- spearman_corr[num_x, num_x]; diag(Xc) <- NA
+idx <- which(abs(Xc) == max(abs(Xc), na.rm = TRUE), arr.ind = TRUE)[1, ]
+pair_xx <- paste(rownames(Xc)[idx[1]], colnames(Xc)[idx[2]], sep = " dan ")
+rho_xx  <- Xc[idx[1], idx[2]]
+```
+
+Korelasi peringkat Spearman dipakai karena data prediktor bersifat diskret dan hubungan yang tidak linear tetap dapat tertangkap selama bersifat monoton. Prediktor dengan korelasi terkuat terhadap Y1 adalah `r top_y1` ($\rho$ = `r fmt(rho_y1[top_y1])`) dan terhadap Y2 adalah `r top_y2` ($\rho$ = `r fmt(rho_y2[top_y2])`). Kedua respons sendiri berkorelasi sangat tinggi ($\rho$ = `r fmt(spearman_corr["Y1", "Y2"])`). Di antara prediktor numerik, pasangan dengan korelasi terkuat adalah `r pair_xx` ($\rho$ = `r fmt(rho_xx)`), yang menunjukkan struktur kolinearitas yang kuat di antara prediktor. Korelasi yang kecil tidak serta-merta berarti prediktor tidak penting, karena hubungan yang tidak monoton atau bersifat interaksi tidak tertangkap oleh korelasi peringkat.
+
+### 4.2.5 Fokus X7 (Glazing Area) dan Potensi Non-linearitas
+
+```{r eda-lowess, fig.height=4}
+## Fokus X7 (Glazing Area) dan potensi non-linearitas ----
+# Kurva LOWESS (setara seaborn regplot lowess=True).
+plot_lowess <- function(target) {
+  lw <- lowess(df$X7, df[[target]], f = 2/3, iter = 3, delta = 0)
+  ggplot(df, aes(x = X7, y = .data[[target]])) +
+    geom_point(alpha = 0.35) +
+    geom_line(data = tibble(X7 = lw$x, fit = lw$y), aes(x = X7, y = fit),
+              inherit.aes = FALSE, color = "firebrick", linewidth = 1) +
+    labs(title = paste("LOWESS: X7 vs", target))
+}
+print(plot_lowess("Y1") | plot_lowess("Y2"))
+```
+
+Kurva LOWESS pada diagram pencar X7 terhadap Y1 dan Y2 dipakai untuk menilai apakah hubungan luas kaca dengan respons mendekati garis lurus. Penyimpangan kurva dari pola lurus menjadi indikasi awal ketaklinearan yang nantinya dikonfirmasi melalui perbandingan model linear (Lasso dan OLS) dengan baseline RF. Perlu dicatat bahwa X7 hanya memiliki empat nilai diskret sehingga titik-titik data berkelompok pada empat posisi.
+
+### 4.2.6 Prediktor Kategorik terhadap Y1 dan Y2
+
+```{r eda-catbox, fig.height=7}
+## Prediktor kategorik terhadap Y1 dan Y2 ----
+box_cat <- function(x, y, title) {
+  ggplot(df, aes(x = factor(.data[[x]]), y = .data[[y]])) +
+    geom_boxplot(fill = "steelblue", alpha = 0.6) +
+    labs(title = title, x = x, y = y)
+}
+print(
+  (box_cat("X6", "Y1", "Y1 by Orientation (X6)") | box_cat("X8", "Y1", "Y1 by Glazing Distribution (X8)")) /
+    (box_cat("X6", "Y2", "Y2 by Orientation (X6)") | box_cat("X8", "Y2", "Y2 by Glazing Distribution (X8)"))
+)
+```
+
+*Boxplot* memperlihatkan seberapa besar sebaran Y1 dan Y2 berubah antarkategori orientasi (X6) dan distribusi luas kaca (X8). Kategori dengan sebaran yang hampir sama menandakan kontribusi variabel tersebut yang kecil terhadap respons. Kesimpulan ini dibandingkan dengan hasil seleksi Lasso dan *permutation importance* RF pada bagian selanjutnya.
+
+## 4.3 Pembagian Data, Preprocessing, dan Estimasi Model Linear
+
+### 4.3.1 Pembagian Data Latih dan Uji
+
+```{r split}
+# Langkah 4 - Fit Lasso dan Baseline ------------------------------------------
+# Dua model per response:
+#   1. Multiple Linear Regression (baseline)
+#   2. Lasso, alpha (lambda di glmnet) dipilih dengan cross-validation
+# Preprocessing:
+#   - X1, X2, X3, X4, X5, X7 distandardisasi (mean 0, sd populasi 1)
+#   - X6 dan X8 di-one-hot encode (kategori pertama sebagai referensi)
+#
+# Catatan: fungsi Lasso glmnet dengan standardize = FALSE memiliki fungsi objektif
+# yang sama dengan sklearn Lasso, yaitu (1/(2n))*RSS + alpha*|beta|_1, sehingga
+# "lambda" di glmnet setara dengan "alpha" di sklearn.
+
+## Split train/test (sekali, agar Y1 dan Y2 memakai observasi yang sama) ----
+set.seed(42)
+n_obs    <- nrow(df)
+n_test   <- ceiling(0.20 * n_obs)          # test_size = 0.20
+test_idx <- sample(n_obs, n_test)
+
+X_train <- df[-test_idx, FEATURES];  X_test <- df[test_idx, FEATURES]
+Y_train <- df[-test_idx, TARGETS];   Y_test <- df[test_idx, TARGETS]
+
+cat("X_train:", nrow(X_train), "x", ncol(X_train), "\n")
+cat("X_test :", nrow(X_test),  "x", ncol(X_test),  "\n")
+```
+
+Data dibagi secara acak menjadi `r nrow(X_train)` observasi latih (80%) dan `r nrow(X_test)` observasi uji (20%) dengan `set.seed(42)` untuk reproduksibilitas. Pembagian dilakukan sekali sehingga Y1 dan Y2 (serta seluruh model) memakai observasi latih dan uji yang sama.
+
+### 4.3.2 Preprocessing
+
+```{r preprocessing}
+## Preprocessing (dipelajari HANYA dari data training) ----
+fit_prep <- function(X) {
+  sc <- vapply(X[NUMERIC_FEATURES], function(v) sqrt(mean((v - mean(v))^2)), numeric(1))
+  sc[sc == 0] <- 1
+  list(
+    center = vapply(X[NUMERIC_FEATURES], mean, numeric(1)),
+    scale  = sc,
+    levels = lapply(X[CATEGORICAL_FEATURES], function(v) sort(unique(v)))
+  )
+}
+
+apply_prep <- function(prep, X) {
+  # numerik: standardisasi
+  num <- do.call(cbind, lapply(NUMERIC_FEATURES, function(v) {
+    (X[[v]] - prep$center[[v]]) / prep$scale[[v]]
+  }))
+  colnames(num) <- NUMERIC_FEATURES
+  
+  # kategorik: one-hot, drop = "first"; level tak dikenal -> semua dummy 0
+  cat_list <- lapply(CATEGORICAL_FEATURES, function(v) {
+    lv <- prep$levels[[v]][-1]
+    m  <- matrix(vapply(lv, function(l) as.numeric(X[[v]] == l), numeric(nrow(X))),
+                 nrow = nrow(X), ncol = length(lv))
+    colnames(m) <- paste0(v, "_", lv)
+    m
+  })
+  
+  cbind(num, do.call(cbind, cat_list))
+}
+```
+
+Pembakuan dan daftar level kategori dipelajari hanya dari data latih dan kemudian diterapkan pada data uji untuk mencegah kebocoran informasi (*data leakage*). Pembakuan diperlukan karena penalti $\ell_1$ sensitif terhadap skala peubah. Pada validasi silang berulang, tahap ini diulang di setiap lipatan latih luar.
+
+### 4.3.3 Fungsi Estimasi Model Linear (OLS dan Lasso)
+
+```{r fit-functions}
+## Fungsi fit model (baseline OLS + LassoCV) untuk SATU response ----
+LAMBDA_GRID <- 10^seq(2, -4, length.out = 200)   # setara np.logspace(-4, 2, 200), urut menurun
+INNER_FOLDS <- 5
+
+fit_target_models <- function(X_tr, y_tr, seed = 42) {
+  prep <- fit_prep(X_tr)
+  Z    <- apply_prep(prep, X_tr)
+  
+  # Baseline: regresi linear (pada rank-deficient, lm memberi NA pada koefisien yang teralias)
+  baseline <- lm(y ~ ., data = data.frame(y = y_tr, Z, check.names = FALSE))
+  
+  # Lasso dengan inner 5-fold CV; alpha optimal = lambda dengan MSE CV minimum
+  set.seed(seed)
+  foldid <- sample(rep(seq_len(INNER_FOLDS), length.out = nrow(Z)))
+  lasso <- cv.glmnet(
+    x = Z, y = y_tr, alpha = 1, lambda = LAMBDA_GRID, foldid = foldid,
+    standardize = FALSE, thresh = 1e-10, maxit = 1e6
+  )
+  
+  list(prep = prep, baseline = baseline, lasso = lasso)
+}
+
+MODEL_NAMES <- c("Linear Regression", "Lasso")
+
+predict_model <- function(fit, model_name, X_new) {
+  Z <- apply_prep(fit$prep, X_new)
+  if (model_name == "Linear Regression") {
+    # peringatan "rank-deficient fit" diharapkan (X2 = X3 + 2*X4); prediksi tetap valid
+    suppressWarnings(as.numeric(predict(fit$baseline, newdata = data.frame(Z, check.names = FALSE))))
+  } else {
+    as.numeric(predict(fit$lasso, newx = Z, s = "lambda.min"))
+  }
+}
+```
+
+### 4.3.4 Estimasi Model untuk Y1 dan Y2
+
+```{r fit-models}
+## Fit model untuk Y1 dan Y2 secara terpisah ----
+fitted_models <- setNames(
+  lapply(TARGETS, function(t) fit_target_models(X_train, Y_train[[t]])),
+  TARGETS
+)
+
+for (t in TARGETS) {
+  cat(t, "| Optimal alpha:", fitted_models[[t]]$lasso$lambda.min, "\n")
+}
+```
+
+```{r narasi-alpha, include=FALSE}
+alpha_y1 <- fitted_models$Y1$lasso$lambda.min
+alpha_y2 <- fitted_models$Y2$lasso$lambda.min
+```
+
+Nilai parameter regularisasi optimal hasil validasi silang 5-lipat pada data latih adalah $\lambda$ = `r fmtp(alpha_y1)` untuk Y1 dan `r fmtp(alpha_y2)` untuk Y2. Semakin kecil nilai ini, semakin ringan regularisasi yang diterapkan.
+
+### 4.3.5 Koefisien Lasso pada Level Fitur
+
+```{r lasso-coef}
+## Koefisien Lasso pada level fitur hasil encoding ----
+lasso_coef_table <- function(fit) {
+  b <- as.matrix(coef(fit$lasso, s = "lambda.min"))
+  b <- b[rownames(b) != "(Intercept)", 1]
+  tibble(
+    Feature     = names(b),
+    Coefficient = unname(b),
+    Selected    = abs(unname(b)) > 1e-10
+  )
+}
+
+lasso_feature_tables <- list()
+for (t in TARGETS) {
+  lasso_feature_tables[[t]] <- lasso_coef_table(fitted_models[[t]]) %>%
+    arrange(desc(abs(Coefficient)))
+  cat("\n", t, "\n", sep = "")
+  print(lasso_feature_tables[[t]])
+}
+```
+
+### 4.3.6 Seleksi pada Level Variabel Asli X1 sampai X8
+
+```{r lasso-selection}
+## Seleksi dikembalikan ke level variabel asli X1-X8 ----
+# Variabel kategorik dianggap terpilih jika minimal satu dummy-nya bukan nol.
+original_variable <- function(feature_name) sub("_.*$", "", feature_name)   # "X6_3" -> "X6"
+
+summarise_selection <- function(coef_table) {
+  coef_table %>%
+    mutate(Variable = original_variable(Feature)) %>%
+    group_by(Variable) %>%
+    summarise(
+      Nonzero_Encoded_Terms = sum(Selected),
+      Max_Abs_Coefficient   = max(abs(Coefficient)),
+      .groups = "drop"
+    ) %>%
+    mutate(Selected = Nonzero_Encoded_Terms > 0) %>%
+    arrange(match(Variable, FEATURES)) %>%
+    select(Variable, Selected, Max_Abs_Coefficient, Nonzero_Encoded_Terms)
+}
+
+selection_tables <- lapply(lasso_feature_tables, summarise_selection)
+
+selection_summary <- inner_join(
+  selection_tables[["Y1"]], selection_tables[["Y2"]],
+  by = "Variable", suffix = c("_Y1", "_Y2")
+)
+print(selection_summary)
+```
+
+```{r narasi-selection, include=FALSE}
+n_feat <- nrow(lasso_feature_tables$Y1)
+sel_n  <- sapply(TARGETS, function(t) sum(lasso_feature_tables[[t]]$Selected))
+elim_f <- lapply(TARGETS, function(t) lasso_feature_tables[[t]]$Feature[!lasso_feature_tables[[t]]$Selected])
+names(elim_f) <- TARGETS
+grp_elim <- lapply(elim_f, function(x) intersect(c("X2", "X3", "X4"), x))
+top3 <- lapply(TARGETS, function(t) head(lasso_feature_tables[[t]]$Feature[lasso_feature_tables[[t]]$Selected], 3))
+names(top3) <- TARGETS
+sel_var_y1  <- selection_summary$Variable[selection_summary$Selected_Y1]
+sel_var_y2  <- selection_summary$Variable[selection_summary$Selected_Y2]
+elim_var_y1 <- selection_summary$Variable[!selection_summary$Selected_Y1]
+elim_var_y2 <- selection_summary$Variable[!selection_summary$Selected_Y2]
+```
+
+Dari `r n_feat` kolom prediktor hasil pengkodean, Lasso mempertahankan `r sel_n["Y1"]` kolom untuk Y1 dan `r sel_n["Y2"]` kolom untuk Y2. Kolom yang tereliminasi (koefisien tepat nol) adalah `r lst(elim_f$Y1)` pada Y1 dan `r lst(elim_f$Y2)` pada Y2. Kolom dengan koefisien terbakukan terbesar (nilai mutlak) adalah `r lst(top3$Y1)` untuk Y1 dan `r lst(top3$Y2)` untuk Y2.
+
+Pada level variabel asli, variabel yang terpilih untuk Y1 adalah `r lst(sel_var_y1)` (tereliminasi: `r lst(elim_var_y1)`), sedangkan untuk Y2 adalah `r lst(sel_var_y2)` (tereliminasi: `r lst(elim_var_y2)`). Variabel kategorik dinyatakan terpilih apabila minimal satu *dummy*-nya bernilai tidak nol. Di antara X2, X3, dan X4 yang terikat identitas $X_2 = X_3 + 2X_4$, kolom yang tereliminasi adalah `r lst(grp_elim$Y1)` untuk Y1 dan `r lst(grp_elim$Y2)` untuk Y2. Hal ini sejalan dengan sifat Lasso yang hanya membutuhkan sebagian anggota kelompok redundan untuk merekonstruksi informasi yang sama, sehingga Lasso memilih satu konfigurasi dari himpunan prediktor redundan dan dengan demikian mengatasi multikolinearitas sempurna yang tidak dapat ditangani OLS. Karena koefisien pada peubah yang saling berkorelasi tinggi bergantung pada peubah pengganti yang terpilih, tereliminasinya suatu peubah tidak boleh ditafsirkan sebagai ketiadaan pengaruh peubah tersebut. Koefisien pada kelompok X1, X2, X4, dan X5 yang saling berkorelasi tinggi sebaiknya dibaca sebagai kontribusi gabungan, bukan efek terpisah.
+
+## 4.4 Diagnostik Model
+
+Diagnostik dilakukan pada model OLS karena residual dan jarak Cook memiliki interpretasi klasik pada OLS. Inferensi koefisien OLS dibaca dengan hati-hati karena adanya multikolinearitas sempurna di antara X2, X3, dan X4.
+
+### 4.4.1 Matriks Desain dan Rank
+
+```{r diag-design}
+# Langkah 5 - Diagnostic Model ------------------------------------------------
+# Diagnostic dilakukan pada baseline OLS karena residual dan Cook's Distance
+# memiliki interpretasi klasik pada OLS. Inferensi koefisien OLS harus dibaca
+# hati-hati karena ada multikolinearitas sempurna di antara X2, X3, dan X4.
+
+## Design matrix OLS + cek rank ----
+prep_for_ols   <- fit_prep(X_train)
+X_train_design <- apply_prep(prep_for_ols, X_train)
+X_train_const  <- cbind(const = 1, X_train_design)
+
+sv               <- svd(X_train_const)$d
+matrix_rank      <- sum(sv > max(dim(X_train_const)) * max(sv) * .Machine$double.eps)
+n_columns        <- ncol(X_train_const)
+condition_number <- max(sv) / min(sv)
+
+cat("Jumlah kolom design matrix :", n_columns, "\n")
+cat("Rank design matrix         :", matrix_rank, "\n")
+cat("Rank deficient?            :", matrix_rank < n_columns, "\n")
+cat("Condition number           :", condition_number, "\n")
+```
+
+### 4.4.2 Variance Inflation Factor (VIF)
+
+```{r diag-vif}
+## VIF ----
+# VIF sangat besar / Inf adalah konsekuensi dependensi linear sempurna.
+# Dihitung manual: VIF_j = 1 / (1 - R2_j), R2_j dari regresi kolom j pada kolom lain.
+vif_one <- function(j, M) {
+  y   <- M[, j]
+  fit <- lm(y ~ M[, -j, drop = FALSE])
+  r2  <- 1 - sum(residuals(fit)^2) / sum((y - mean(y))^2)
+  1 / (1 - r2)
+}
+
+vif_table <- tibble(
+  Variable = colnames(X_train_design),
+  VIF      = vapply(seq_len(ncol(X_train_design)), vif_one, numeric(1), M = X_train_design)
+) %>%
+  arrange(desc(VIF))
+print(vif_table)
+```
+
+```{r narasi-vif, include=FALSE}
+n_vif10 <- sum(vif_table$VIF > 10, na.rm = TRUE)
+```
+
+Matriks desain memiliki `r n_columns` kolom (termasuk intersep) dengan rank `r matrix_rank`, sehingga matriks desain `r ifelse(matrix_rank < n_columns, "*rank deficient*", "berpangkat penuh")` dengan *condition number* `r fmtp(condition_number)`. Sebanyak `r n_vif10` dari `r nrow(vif_table)` kolom prediktor memiliki VIF di atas 10, dengan VIF tertinggi pada `r vif_table$Variable[1]` (`r fmtp(vif_table$VIF[1])`). Nilai VIF yang sangat besar atau tak terhingga merupakan konsekuensi dari dependensi linear sempurna $X_2 = X_3 + 2X_4$, sedangkan variabel lain yang ikut tinggi (misalnya X1 dan X5) mencerminkan kolinearitas yang kuat dengan variabel luas. Kondisi ini membuat OLS tidak memiliki solusi tunggal dan menjustifikasi penggunaan metode regularisasi.
+
+### 4.4.3 Model OLS, Uji Asumsi, dan Observasi Berpengaruh
+
+```{r diag-ols}
+## Residual dan influential observations untuk Y1 dan Y2 ----
+jarque_bera_p <- function(x) {
+  n  <- length(x)
+  m  <- x - mean(x)
+  m2 <- mean(m^2); m3 <- mean(m^3); m4 <- mean(m^4)
+  S  <- m3 / m2^1.5
+  K  <- m4 / m2^2
+  JB <- n / 6 * (S^2 + (K - 3)^2 / 4)
+  pchisq(JB, df = 2, lower.tail = FALSE)
+}
+
+ols_models      <- list()
+diagnostic_rows <- list()
+cook_threshold  <- 4 / nrow(X_train)
+
+for (t in TARGETS) {
+  m <- lm(y ~ ., data = data.frame(y = Y_train[[t]], X_train_design, check.names = FALSE))
+  ols_models[[t]] <- m
+  
+  res     <- residuals(m)
+  bp      <- bptest(m, studentize = TRUE)      # Breusch-Pagan (Koenker)
+  cooks_d <- cooks.distance(m)
+  
+  diagnostic_rows[[t]] <- tibble(
+    Target          = t,
+    R2_OLS          = summary(m)$r.squared,
+    Breusch_Pagan_p = unname(bp$p.value),
+    Jarque_Bera_p   = jarque_bera_p(res),
+    Cook_Threshold  = cook_threshold,
+    N_Influential   = sum(cooks_d > cook_threshold)
+  )
+}
+diagnostic_summary <- bind_rows(diagnostic_rows)
+print(diagnostic_summary)
+```
+
+```{r narasi-diag, include=FALSE}
+ds <- diagnostic_summary
+```
+
+Model OLS menghasilkan $R^2$ pada data latih sebesar `r fmt(ds$R2_OLS[1])` (Y1) dan `r fmt(ds$R2_OLS[2])` (Y2). Uji Breusch-Pagan menghasilkan *p-value* `r fmtp(ds$Breusch_Pagan_p[1])` untuk Y1 dan `r fmtp(ds$Breusch_Pagan_p[2])` untuk Y2, sehingga hipotesis homoskedastisitas `r ifelse(all(ds$Breusch_Pagan_p < 0.05), "ditolak pada kedua respons (terdapat heteroskedastisitas)", "tidak ditolak pada seluruh respons")` pada taraf 5%. Uji Jarque-Bera menghasilkan *p-value* `r fmtp(ds$Jarque_Bera_p[1])` (Y1) dan `r fmtp(ds$Jarque_Bera_p[2])` (Y2), sehingga normalitas residual `r ifelse(all(ds$Jarque_Bera_p < 0.05), "ditolak pada kedua respons", "tidak ditolak pada seluruh respons")`. Ambang jarak Cook $4/n$ adalah `r fmt(ds$Cook_Threshold[1], 5)` dengan `r ds$N_Influential[1]` observasi berpengaruh pada Y1 dan `r ds$N_Influential[2]` pada Y2. Pelanggaran asumsi menunjukkan bahwa inferensi klasik OLS (uji-t dan selang kepercayaan) tidak dapat diandalkan pada data ini. Regresi Lasso tidak mensyaratkan normalitas galat untuk menghasilkan penduga titik dan dinilai melalui kinerja prediksi pada data di luar sampel, sehingga tetap layak dipakai untuk tujuan prediksi dan seleksi variabel.
+
+```{r diag-resid-plots, fig.height=7}
+# Residual vs Fitted dan Q-Q plot
+plot_resid <- function(m, t) {
+  ggplot(tibble(fitted = fitted(m), resid = residuals(m)), aes(x = fitted, y = resid)) +
+    geom_point(alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = paste("Residual vs Fitted -", t), x = "Fitted values", y = "Residuals")
+}
+
+plot_qq <- function(m, t) {
+  r <- residuals(m)
+  ggplot(tibble(z = (r - mean(r)) / sd(r)), aes(sample = z)) +
+    stat_qq() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = paste("Q-Q Plot -", t), x = "Theoretical Quantiles", y = "Sample Quantiles")
+}
+
+print(
+  (plot_resid(ols_models$Y1, "Y1") | plot_qq(ols_models$Y1, "Y1")) /
+    (plot_resid(ols_models$Y2, "Y2") | plot_qq(ols_models$Y2, "Y2"))
+)
+```
+
+*Plot* residual terhadap nilai *fitted* dan *Q-Q plot* residual digunakan untuk memeriksa pola sistematis, sebaran ragam yang tidak konstan, dan penyimpangan dari normalitas pada model OLS.
+
+```{r diag-cook, fig.height=6}
+# Cook's Distance
+plot_cook <- function(m, t) {
+  cd <- as.numeric(cooks.distance(m))
+  ggplot(tibble(obs = seq_along(cd) - 1, cooks = cd), aes(x = obs, y = cooks)) +
+    geom_segment(aes(xend = obs, yend = 0)) +
+    geom_point(size = 0.6) +
+    geom_hline(yintercept = cook_threshold, linetype = "dashed", color = "red") +
+    annotate("text", x = Inf, y = cook_threshold, label = "4/n",
+             hjust = 1.1, vjust = -0.6, color = "red") +
+    labs(title = paste("Cook's Distance -", t),
+         x = "Training Observation", y = "Cook's Distance")
+}
+print(plot_cook(ols_models$Y1, "Y1") / plot_cook(ols_models$Y2, "Y2"))
+```
+
+Grafik jarak Cook menunjukkan observasi latih yang melampaui ambang $4/n$ (garis putus-putus merah) dan karenanya berpengaruh besar terhadap estimasi model.
+
+## 4.5 Evaluasi Model Linear: Data Uji dan Validasi Silang Berulang
+
+Bagian ini menilai regresi linear (OLS) dan Lasso melalui RMSE, MAE, dan $R^2$ pada data uji dan pada validasi silang berulang. Model baseline RF ditambahkan pada Subbab 4.6 dengan partisi data dan lipatan yang identik.
+
+### 4.5.1 Evaluasi pada Data Uji
+
+```{r eval-test}
+# Langkah 6 - Train/Test, Cross-Validation, Inferensi vs Prediksi -------------
+# Prediksi: RMSE, MAE, R2 pada test set dan repeated cross-validation.
+# Inferensi: p-value OLS TIDAK dipakai untuk menyebut variabel "benar-benar penting"
+# karena rank deficiency. Untuk Lasso: koefisien nonzero, konsistensi seleksi pada
+# repeated CV, dan performa out-of-sample.
+
+metric_rmse <- function(y, p) sqrt(mean((y - p)^2))
+metric_mae  <- function(y, p) mean(abs(y - p))
+metric_r2   <- function(y, p) 1 - sum((y - p)^2) / sum((y - mean(y))^2)
+
+## Evaluasi test set ----
+test_results <- map_dfr(TARGETS, function(t) {
+  map_dfr(MODEL_NAMES, function(mn) {
+    pred <- predict_model(fitted_models[[t]], mn, X_test)
+    tibble(
+      Target = t, Model = mn,
+      RMSE = metric_rmse(Y_test[[t]], pred),
+      MAE  = metric_mae(Y_test[[t]], pred),
+      R2   = metric_r2(Y_test[[t]], pred)
+    )
+  })
+})
+print(test_results)
+```
+
+```{r narasi-test-lin, include=FALSE}
+gm <- function(d, t, m, col) d[[col]][d$Target == t & d$Model == m]
+```
+
+Pada data uji, Lasso menghasilkan $R^2$ sebesar `r fmt(gm(test_results, "Y1", "Lasso", "R2"))` untuk Y1 dan `r fmt(gm(test_results, "Y2", "Lasso", "R2"))` untuk Y2, dengan RMSE `r fmt(gm(test_results, "Y1", "Lasso", "RMSE"))` dan `r fmt(gm(test_results, "Y2", "Lasso", "RMSE"))`, serta MAE `r fmt(gm(test_results, "Y1", "Lasso", "MAE"))` dan `r fmt(gm(test_results, "Y2", "Lasso", "MAE"))`. Sebagai pembanding, regresi linear (OLS) menghasilkan $R^2$ uji `r fmt(gm(test_results, "Y1", "Linear Regression", "R2"))` (Y1) dan `r fmt(gm(test_results, "Y2", "Linear Regression", "R2"))` (Y2). Karena OLS pada matriks *rank deficient* dan Lasso sama-sama merupakan model linear pada prediktor yang sama, kinerja prediksi keduanya cenderung berdekatan. Keunggulan Lasso terletak pada aspek lain, yaitu tetap terdefinisi di bawah multikolinearitas sempurna, menghasilkan koefisien yang stabil, dan melakukan seleksi variabel secara otomatis. Perbandingan yang lebih andal dilakukan pada validasi silang berulang di bawah ini karena hasil satu kali pembagian data dapat bergantung pada pembagian tertentu.
+
+```{r eval-avp-linear, fig.height=7}
+## Actual vs Predicted ----
+plot_avp <- function(t, mn) {
+  d <- tibble(Actual = Y_test[[t]], Predicted = predict_model(fitted_models[[t]], mn, X_test))
+  ggplot(d, aes(x = Actual, y = Predicted)) +
+    geom_point(alpha = 0.65) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = paste(t, "-", mn))
+}
+print(
+  (plot_avp("Y1", "Linear Regression") | plot_avp("Y1", "Lasso")) /
+    (plot_avp("Y2", "Linear Regression") | plot_avp("Y2", "Lasso"))
+)
+```
+
+### 4.5.2 Validasi Silang Berulang (10-lipat $\times$ 5 Pengulangan)
+
+Pada setiap lipatan latih luar, parameter $\lambda$ Lasso dipilih kembali dengan validasi silang dalam 5-lipat, sehingga lipatan validasi luar tidak dipakai untuk memilih $\lambda$. Proses ini sekaligus mencatat variabel yang terpilih pada setiap lipatan. Bagian ini membutuhkan waktu komputasi yang cukup lama.
+
+```{r cv-repeated}
+## Repeated cross-validation ----
+# 10-fold CV x 5 repeats (outer). Di setiap outer training fold, lambda Lasso
+# kembali dipilih dengan inner 5-fold CV, sehingga validation fold tidak dipakai
+# untuk memilih alpha. Sekaligus mencatat variabel yang terpilih di tiap fold.
+N_SPLITS  <- 10
+N_REPEATS <- 5
+
+cv_rows           <- list()
+selection_records <- list()
+
+for (rep_id in seq_len(N_REPEATS)) {
+  set.seed(42 + rep_id)
+  fold_assign <- sample(rep(seq_len(N_SPLITS), length.out = n_obs))
+  
+  for (k in seq_len(N_SPLITS)) {
+    tr      <- which(fold_assign != k)
+    te      <- which(fold_assign == k)
+    X_tr    <- df[tr, FEATURES]
+    X_te    <- df[te, FEATURES]
+    fold_no <- (rep_id - 1) * N_SPLITS + k
+    
+    for (t in TARGETS) {
+      y_tr <- df[[t]][tr]
+      y_te <- df[[t]][te]
+      fit  <- fit_target_models(X_tr, y_tr, seed = 1000 * rep_id + k)
+      
+      for (mn in MODEL_NAMES) {
+        pred <- predict_model(fit, mn, X_te)
+        cv_rows[[length(cv_rows) + 1]] <- tibble(
+          Target = t, Model = mn, Repeat = rep_id, Fold = fold_no,
+          RMSE = metric_rmse(y_te, pred),
+          MAE  = metric_mae(y_te, pred),
+          R2   = metric_r2(y_te, pred)
+        )
+      }
+      
+      selection_records[[length(selection_records) + 1]] <-
+        lasso_coef_table(fit) %>%
+        summarise_selection() %>%
+        mutate(Target = t, Fold = fold_no)
+    }
+  }
+  cat("Repeated CV: repeat", rep_id, "dari", N_REPEATS, "selesai\n")
+}
+
+cv_results <- bind_rows(cv_rows)
+print(head(cv_results))
+```
+
+```{r cv-summary-linear}
+## Ringkasan ketidakpastian performa ----
+# Q025-Q975 = 95% empirical interval dari hasil resampling (bukan CI inferensial klasik).
+cv_summary <- cv_results %>%
+  group_by(Target, Model) %>%
+  summarise(
+    RMSE_Mean = mean(RMSE),
+    RMSE_SD   = sd(RMSE),
+    RMSE_Q025 = quantile(RMSE, 0.025, names = FALSE),
+    RMSE_Q975 = quantile(RMSE, 0.975, names = FALSE),
+    MAE_Mean  = mean(MAE),
+    MAE_SD    = sd(MAE),
+    R2_Mean   = mean(R2),
+    R2_SD     = sd(R2),
+    R2_Q025   = quantile(R2, 0.025, names = FALSE),
+    R2_Q975   = quantile(R2, 0.975, names = FALSE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+print(cv_summary)
+
+p_cv <- cv_results %>%
+  pivot_longer(c(RMSE, MAE, R2), names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(Metric, levels = c("RMSE", "MAE", "R2"))) %>%
+  ggplot(aes(x = Target, y = Value, fill = Model)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(title = "Repeated CV (10-fold x 5 repeats)", y = NULL)
+print(p_cv)
+```
+
+```{r narasi-cv-lin, include=FALSE}
+lasso_lt_ols <- sapply(TARGETS, function(t)
+  gm(cv_summary, t, "Lasso", "RMSE_Mean") < gm(cv_summary, t, "Linear Regression", "RMSE_Mean"))
+```
+
+Berdasarkan validasi silang berulang, RMSE rerata Lasso adalah `r fmt(gm(cv_summary, "Y1", "Lasso", "RMSE_Mean"))` (simpangan baku `r fmt(gm(cv_summary, "Y1", "Lasso", "RMSE_SD"))`) untuk Y1 dan `r fmt(gm(cv_summary, "Y2", "Lasso", "RMSE_Mean"))` (simpangan baku `r fmt(gm(cv_summary, "Y2", "Lasso", "RMSE_SD"))`) untuk Y2, dengan $R^2$ rerata `r fmt(gm(cv_summary, "Y1", "Lasso", "R2_Mean"))` dan `r fmt(gm(cv_summary, "Y2", "Lasso", "R2_Mean"))`. Sebagai perbandingan, RMSE rerata regresi linear adalah `r fmt(gm(cv_summary, "Y1", "Linear Regression", "RMSE_Mean"))` (Y1) dan `r fmt(gm(cv_summary, "Y2", "Linear Regression", "RMSE_Mean"))` (Y2). Secara rerata, Lasso `r ifelse(all(lasso_lt_ols), "memiliki RMSE lebih kecil daripada regresi linear pada kedua respons", ifelse(any(lasso_lt_ols), "memiliki RMSE lebih kecil daripada regresi linear pada salah satu respons saja", "tidak memiliki RMSE lebih kecil daripada regresi linear"))`. Lebar interval empiris (Q025 sampai Q975) pada tabel ringkasan menggambarkan ketidakpastian kinerja akibat perbedaan sampel latih dan validasi, dan tidak dibaca sebagai selang kepercayaan inferensial.
+
+### 4.5.3 Stabilitas Seleksi Variabel Lasso
+
+```{r cv-selection-stability}
+## Stabilitas seleksi Lasso pada 50 outer folds ----
+# Selection frequency: 100% = selalu terpilih di seluruh outer folds;
+# nilai lebih rendah = seleksi lebih sensitif terhadap sampel training.
+selection_cv <- bind_rows(selection_records)
+
+selection_stability <- selection_cv %>%
+  group_by(Target, Variable) %>%
+  summarise(
+    Selection_Frequency        = mean(Selected) * 100,
+    Median_Max_Abs_Coefficient = median(Max_Abs_Coefficient),
+    .groups = "drop"
+  ) %>%
+  arrange(Target, desc(Selection_Frequency))
+
+print(selection_stability %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
+```
+
+```{r narasi-stab, include=FALSE}
+stab <- function(t) selection_stability %>% filter(Target == t)
+always <- lapply(TARGETS, function(t) stab(t) %>% filter(Selection_Frequency == 100) %>% pull(Variable))
+partial <- lapply(TARGETS, function(t) stab(t) %>% filter(Selection_Frequency < 100) %>%
+  mutate(txt = paste0(Variable, " (", fmt(Selection_Frequency, 1), "%)")) %>% pull(txt))
+names(always) <- names(partial) <- TARGETS
+```
+
+Frekuensi seleksi 100% berarti variabel selalu terpilih pada seluruh 50 lipatan luar. Untuk Y1, variabel yang selalu terpilih adalah `r lst(always$Y1)`, sedangkan variabel dengan seleksi tidak selalu stabil adalah `r lst(partial$Y1)`. Untuk Y2, variabel yang selalu terpilih adalah `r lst(always$Y2)`, sedangkan yang tidak selalu stabil adalah `r lst(partial$Y2)`. Variabel dengan frekuensi seleksi rendah adalah variabel yang seleksinya sensitif terhadap sampel latih, sehingga interpretasinya perlu lebih berhati-hati.
+
+### 4.5.4 Tabel Jawaban Utama Seleksi Variabel
+
+```{r final-answer}
+## Tabel jawaban utama ----
+final_answer <- selection_summary %>%
+  select(Variable, Selected_Y1, Max_Abs_Coefficient_Y1, Selected_Y2, Max_Abs_Coefficient_Y2) %>%
+  left_join(
+    selection_stability %>%
+      filter(Target == "Y1") %>%
+      select(Variable, CV_Selection_Frequency_Y1 = Selection_Frequency),
+    by = "Variable"
+  ) %>%
+  left_join(
+    selection_stability %>%
+      filter(Target == "Y2") %>%
+      select(Variable, CV_Selection_Frequency_Y2 = Selection_Frequency),
+    by = "Variable"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+print(final_answer)
+```
+
+Tabel di atas merangkum jawaban atas pertanyaan penelitian: variabel yang terpilih pada model final (data latih), besar koefisien mutlak maksimum, dan frekuensi seleksinya pada validasi silang berulang untuk masing-masing respons.
+
+## 4.6 Model Baseline Random Forest
+
+Pada bagian ini *Random Forest* dibangun sebagai **model baseline** dan dibandingkan dengan regresi linear serta Lasso pada data uji dan lipatan validasi silang yang sama. RF memakai delapan prediktor asli (X1 sampai X8) dengan X6 dan X8 sebagai faktor, sehingga tidak terpengaruh oleh hubungan $X_2 = X_3 + 2X_4$ dan tidak memerlukan pembakuan.
+
+### 4.6.1 Pengaturan Random Forest
+
+```{r rf-settings}
+# Langkah 7 - Random Forest Benchmark -----------------------------------------
+
+## Pengaturan RF ----
+RF_NUM_TREES <- 500
+RF_GRID <- expand_grid(
+  mtry          = c(2, 4, 6, 8),       # jumlah prediktor acak di tiap split (maks 8)
+  min.node.size = c(1, 5, 10)          # ukuran minimum node daun
+)
+print(RF_GRID)
+
+# Level kategori X6 dan X8 ditetapkan dari seluruh data (hanya level, tanpa Y),
+# agar faktor konsisten di semua split/fold.
+RF_LEVELS <- lapply(df[CATEGORICAL_FEATURES], function(v) sort(unique(v)))
+
+rf_frame <- function(X) {
+  X <- as.data.frame(X)
+  for (v in CATEGORICAL_FEATURES) X[[v]] <- factor(X[[v]], levels = RF_LEVELS[[v]])
+  X
+}
+```
+
+### 4.6.2 Fungsi Tuning dan Estimasi RF
+
+```{r rf-functions}
+## Fungsi tuning + fit RF untuk SATU response ----
+# Setiap kombinasi grid di-fit pada data training, lalu dipilih yang OOB RMSE-nya
+# minimum. Model terbaik kemudian di-fit ulang dengan permutation importance.
+fit_rf_model <- function(X_tr, y_tr, seed = 42, importance = "none") {
+  dat <- data.frame(rf_frame(X_tr), y = y_tr)
+  
+  grid_res <- RF_GRID %>%
+    mutate(OOB_RMSE = map2_dbl(mtry, min.node.size, function(m, nd) {
+      fit <- ranger(
+        y ~ ., data = dat, num.trees = RF_NUM_TREES, mtry = m,
+        min.node.size = nd, respect.unordered.factors = "order",
+        seed = seed, num.threads = 1
+      )
+      sqrt(fit$prediction.error)          # prediction.error = OOB MSE
+    }))
+  
+  best <- grid_res %>% slice_min(OOB_RMSE, n = 1, with_ties = FALSE)
+  
+  model <- ranger(
+    y ~ ., data = dat, num.trees = RF_NUM_TREES, mtry = best$mtry,
+    min.node.size = best$min.node.size, respect.unordered.factors = "order",
+    importance = importance, seed = seed, num.threads = 1
+  )
+  
+  list(model = model, grid = grid_res, best = best)
+}
+
+predict_rf <- function(rf_fit, X_new) {
+  as.numeric(predict(rf_fit$model, data = rf_frame(X_new))$predictions)
+}
+```
+
+### 4.6.3 Tuning RF pada Data Latih
+
+```{r rf-tuning, fig.height=4}
+## 7.1 Tuning RF pada data training (split yang sama dengan Lasso) ----
+rf_models <- setNames(
+  lapply(TARGETS, function(t) fit_rf_model(X_train, Y_train[[t]], seed = 42,
+                                           importance = "permutation")),
+  TARGETS
+)
+
+rf_best_params <- map_dfr(TARGETS, function(t) {
+  rf_models[[t]]$best %>% mutate(Target = t, .before = 1)
+})
+print(rf_best_params)
+
+# Visual hasil grid tuning (OOB RMSE)
+plot_rf_grid <- function(t) {
+  ggplot(rf_models[[t]]$grid,
+         aes(x = factor(mtry), y = factor(min.node.size), fill = OOB_RMSE)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.3f", OOB_RMSE)), size = 3.5) +
+    scale_fill_gradient(low = "#2C7FB8", high = "#EDF8B1") +
+    labs(title = paste("RF Tuning (OOB RMSE) -", t),
+         x = "mtry", y = "min.node.size", fill = "OOB RMSE")
+}
+print(plot_rf_grid("Y1") | plot_rf_grid("Y2"))
+```
+
+```{r narasi-rf-tune, include=FALSE}
+rf_par <- function(t, col) rf_best_params[[col]][rf_best_params$Target == t]
+```
+
+Hasil *tuning* dengan RMSE OOB terkecil pada data latih adalah `mtry` = `r rf_par("Y1", "mtry")` dan `min.node.size` = `r rf_par("Y1", "min.node.size")` untuk Y1 (RMSE OOB `r fmt(rf_par("Y1", "OOB_RMSE"))`), serta `mtry` = `r rf_par("Y2", "mtry")` dan `min.node.size` = `r rf_par("Y2", "min.node.size")` untuk Y2 (RMSE OOB `r fmt(rf_par("Y2", "OOB_RMSE"))`). Peta panas menunjukkan RMSE OOB pada seluruh kombinasi kisi.
+
+### 4.6.4 Evaluasi pada Data Uji: OLS vs Lasso vs Random Forest
+
+```{r rf-test}
+## 7.2 Evaluasi test set: OLS vs Lasso vs Random Forest ----
+rf_test_results <- map_dfr(TARGETS, function(t) {
+  pred <- predict_rf(rf_models[[t]], X_test)
+  tibble(
+    Target = t, Model = "Random Forest",
+    RMSE = metric_rmse(Y_test[[t]], pred),
+    MAE  = metric_mae(Y_test[[t]], pred),
+    R2   = metric_r2(Y_test[[t]], pred)
+  )
+})
+
+test_results_all <- bind_rows(test_results, rf_test_results) %>%
+  mutate(Model = factor(Model, levels = c("Linear Regression", "Lasso", "Random Forest"))) %>%
+  arrange(Target, Model)
+print(test_results_all)
+```
+
+```{r rf-avp, fig.height=7}
+# Actual vs Predicted (format sama dengan plot_avp Langkah 6).
+# Fungsi dibuat mandiri agar tidak bergantung pada plot_avp yang mungkin
+# tertimpa oleh objek lain di environment.
+plot_avp_l7 <- function(t, model_name) {
+  pred <- if (model_name == "Random Forest") {
+    predict_rf(rf_models[[t]], X_test)
+  } else {
+    predict_model(fitted_models[[t]], model_name, X_test)
+  }
+  d <- tibble(Actual = Y_test[[t]], Predicted = pred)
+  ggplot(d, aes(x = Actual, y = Predicted)) +
+    geom_point(alpha = 0.65) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = paste(t, "-", model_name))
+}
+print(
+  (plot_avp_l7("Y1", "Lasso") | plot_avp_l7("Y1", "Random Forest")) /
+    (plot_avp_l7("Y2", "Lasso") | plot_avp_l7("Y2", "Random Forest"))
+)
+```
+
+Pada data uji, baseline RF menghasilkan $R^2$ sebesar `r fmt(gm(test_results_all, "Y1", "Random Forest", "R2"))` (Y1) dan `r fmt(gm(test_results_all, "Y2", "Random Forest", "R2"))` (Y2), dengan RMSE `r fmt(gm(test_results_all, "Y1", "Random Forest", "RMSE"))` dan `r fmt(gm(test_results_all, "Y2", "Random Forest", "RMSE"))`, serta MAE `r fmt(gm(test_results_all, "Y1", "Random Forest", "MAE"))` dan `r fmt(gm(test_results_all, "Y2", "Random Forest", "MAE"))`. Sebagai perbandingan, RMSE uji Lasso adalah `r fmt(gm(test_results_all, "Y1", "Lasso", "RMSE"))` (Y1) dan `r fmt(gm(test_results_all, "Y2", "Lasso", "RMSE"))` (Y2). Diagram aktual terhadap prediksi memperlihatkan seberapa rapat titik-titik prediksi terhadap garis diagonal $y = x$ pada masing-masing model. Kesimpulan yang lebih kuat tidak diambil dari satu pembagian data saja, melainkan dari validasi silang berulang di bawah ini.
+
+### 4.6.5 Validasi Silang Berulang RF dengan Lipatan yang Sama
+
+Partisi lipatan luar dibangkitkan ulang dengan `set.seed` yang sama (42 + pengulangan) sehingga identik dengan yang dipakai model linear. Pada setiap lipatan latih luar, RF di-*tuning* ulang dengan galat OOB, sehingga lipatan validasi tidak dipakai untuk *tuning*.
+
+```{r rf-cv-repeated}
+## 7.3 Repeated CV RF dengan fold yang SAMA dengan Lasso ----
+# fold_assign dibangkitkan ulang dengan seed yang sama (42 + rep_id), sehingga
+# partisi fold identik dengan Langkah 6. Di setiap outer training fold, RF
+# di-tuning ulang dengan OOB (validation fold tidak dipakai untuk tuning).
+rf_cv_rows <- list()
+
+for (rep_id in seq_len(N_REPEATS)) {
+  set.seed(42 + rep_id)
+  fold_assign <- sample(rep(seq_len(N_SPLITS), length.out = n_obs))
+  
+  for (k in seq_len(N_SPLITS)) {
+    tr      <- which(fold_assign != k)
+    te      <- which(fold_assign == k)
+    X_tr    <- df[tr, FEATURES]
+    X_te    <- df[te, FEATURES]
+    fold_no <- (rep_id - 1) * N_SPLITS + k
+    
+    for (t in TARGETS) {
+      y_tr <- df[[t]][tr]
+      y_te <- df[[t]][te]
+      fit  <- fit_rf_model(X_tr, y_tr, seed = 1000 * rep_id + k)
+      pred <- predict_rf(fit, X_te)
+      
+      rf_cv_rows[[length(rf_cv_rows) + 1]] <- tibble(
+        Target = t, Model = "Random Forest", Repeat = rep_id, Fold = fold_no,
+        RMSE = metric_rmse(y_te, pred),
+        MAE  = metric_mae(y_te, pred),
+        R2   = metric_r2(y_te, pred),
+        mtry = fit$best$mtry, min.node.size = fit$best$min.node.size
+      )
+    }
+  }
+  cat("Repeated CV RF: repeat", rep_id, "dari", N_REPEATS, "selesai\n")
+}
+
+rf_cv_results <- bind_rows(rf_cv_rows)
+
+# Hyperparameter terpilih di 50 outer folds (stabilitas tuning)
+rf_tuning_stability <- rf_cv_results %>%
+  count(Target, mtry, min.node.size, name = "N_Folds") %>%
+  group_by(Target) %>%
+  mutate(Percent = N_Folds / sum(N_Folds) * 100) %>%
+  ungroup() %>%
+  arrange(Target, desc(N_Folds))
+print(rf_tuning_stability)
+
+# Gabungkan dengan hasil CV OLS dan Lasso
+cv_results_all <- bind_rows(
+  cv_results,
+  rf_cv_results %>% select(Target, Model, Repeat, Fold, RMSE, MAE, R2)
+) %>%
+  mutate(Model = factor(Model, levels = c("Linear Regression", "Lasso", "Random Forest")))
+```
+
+```{r narasi-rf-tuning-stab, include=FALSE}
+rf_mode <- function(t) rf_tuning_stability %>% filter(Target == t) %>% slice(1)
+```
+
+Kombinasi hiperparameter yang paling sering terpilih pada 50 lipatan luar adalah `mtry` = `r rf_mode("Y1")$mtry` dan `min.node.size` = `r rf_mode("Y1")$min.node.size` untuk Y1 (`r fmt(rf_mode("Y1")$Percent, 1)`% lipatan), serta `mtry` = `r rf_mode("Y2")$mtry` dan `min.node.size` = `r rf_mode("Y2")$min.node.size` untuk Y2 (`r fmt(rf_mode("Y2")$Percent, 1)`% lipatan). Semakin terkonsentrasi pilihan hiperparameter pada satu kombinasi, semakin stabil hasil *tuning*.
+
+### 4.6.6 Ringkasan Kinerja Tiga Model
+
+```{r rf-cv-summary, fig.height=4.5}
+## 7.4 Ringkasan ketidakpastian performa (3 model) ----
+cv_summary_all <- cv_results_all %>%
+  group_by(Target, Model) %>%
+  summarise(
+    RMSE_Mean = mean(RMSE),
+    RMSE_SD   = sd(RMSE),
+    RMSE_Q025 = quantile(RMSE, 0.025, names = FALSE),
+    RMSE_Q975 = quantile(RMSE, 0.975, names = FALSE),
+    MAE_Mean  = mean(MAE),
+    MAE_SD    = sd(MAE),
+    R2_Mean   = mean(R2),
+    R2_SD     = sd(R2),
+    R2_Q025   = quantile(R2, 0.025, names = FALSE),
+    R2_Q975   = quantile(R2, 0.975, names = FALSE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+print(cv_summary_all)
+
+p_cv_all <- cv_results_all %>%
+  pivot_longer(c(RMSE, MAE, R2), names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(Metric, levels = c("RMSE", "MAE", "R2"))) %>%
+  ggplot(aes(x = Target, y = Value, fill = Model)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(title = "Repeated CV (10-fold x 5 repeats): OLS vs Lasso vs Random Forest", y = NULL)
+print(p_cv_all)
+```
+
+```{r narasi-cv-all, include=FALSE}
+cvm <- function(t, m, col) gm(cv_summary_all, t, m, col)
+rf_wins <- sapply(TARGETS, function(t) cvm(t, "Random Forest", "RMSE_Mean") < cvm(t, "Lasso", "RMSE_Mean"))
+rf_gap  <- sapply(TARGETS, function(t) (cvm(t, "Lasso", "RMSE_Mean") - cvm(t, "Random Forest", "RMSE_Mean")) /
+                                        cvm(t, "Lasso", "RMSE_Mean") * 100)
+nl_txt <- if (all(rf_wins)) {
+  "terdapat struktur nonlinear dan/atau interaksi antarprediktor yang tidak tertangkap oleh model linear"
+} else {
+  "keunggulan RF atas model linear tidak konsisten pada kedua respons sehingga bukti ketaklinearan perlu ditelaah lebih lanjut"
+}
+```
+
+Berdasarkan validasi silang berulang, RMSE rerata baseline RF adalah `r fmt(cvm("Y1", "Random Forest", "RMSE_Mean"))` (Y1) dan `r fmt(cvm("Y2", "Random Forest", "RMSE_Mean"))` (Y2), dibandingkan dengan Lasso `r fmt(cvm("Y1", "Lasso", "RMSE_Mean"))` dan `r fmt(cvm("Y2", "Lasso", "RMSE_Mean"))`, serta regresi linear `r fmt(cvm("Y1", "Linear Regression", "RMSE_Mean"))` dan `r fmt(cvm("Y2", "Linear Regression", "RMSE_Mean"))`. RF `r ifelse(all(rf_wins), "menghasilkan RMSE rerata lebih kecil daripada Lasso pada kedua respons", ifelse(any(rf_wins), "menghasilkan RMSE rerata lebih kecil daripada Lasso pada salah satu respons saja", "tidak menghasilkan RMSE rerata lebih kecil daripada Lasso"))`, dengan selisih relatif terhadap RMSE Lasso sebesar `r fmt(rf_gap["Y1"], 1)`% (Y1) dan `r fmt(rf_gap["Y2"], 1)`% (Y2).
+
+Sebagai rujukan pada literatur, Tsanas dan Xifara (2012) melaporkan MAE luar-sampel RF sebesar 0,51 (Y1) dan 1,42 (Y2), sedangkan pada laporan ini MAE rerata RF adalah `r fmt(cvm("Y1", "Random Forest", "MAE_Mean"), 2)` dan `r fmt(cvm("Y2", "Random Forest", "MAE_Mean"), 2)`. Perbandingan ini bersifat indikatif karena skema evaluasi berbeda: baseline pada literatur memakai validasi silang 10-lipat dengan 100 pengulangan, sedangkan laporan ini memakai 10-lipat dengan 5 pengulangan dan *tuning* hiperparameter di dalam setiap lipatan. MAE rerata regresi linear pada laporan ini adalah `r fmt(cvm("Y1", "Linear Regression", "MAE_Mean"), 2)` (Y1) dan `r fmt(cvm("Y2", "Linear Regression", "MAE_Mean"), 2)` (Y2), yang dapat dirujuk terhadap MAE IRLS pada literatur (2,14 dan 2,21).
+
+### 4.6.7 Perbandingan Berpasangan Lasso vs Random Forest per Lipatan
+
+```{r rf-paired, fig.height=4.5}
+## 7.5 Perbandingan paired Lasso vs Random Forest per fold ----
+# Selisih = RMSE_Lasso - RMSE_RF pada fold yang sama.
+# Selisih > 0 berarti RF lebih akurat pada fold tersebut.
+# Q025-Q975 = 95% empirical interval dari 50 fold (bukan uji hipotesis formal,
+# karena fold-fold repeated CV saling bergantung).
+paired_diff <- cv_results_all %>%
+  filter(Model %in% c("Lasso", "Random Forest")) %>%
+  select(Target, Fold, Model, RMSE) %>%
+  pivot_wider(names_from = Model, values_from = RMSE) %>%
+  mutate(Diff_RMSE = Lasso - `Random Forest`)
+
+paired_summary <- paired_diff %>%
+  group_by(Target) %>%
+  summarise(
+    Mean_Diff_RMSE   = mean(Diff_RMSE),
+    SD_Diff_RMSE     = sd(Diff_RMSE),
+    Q025_Diff_RMSE   = quantile(Diff_RMSE, 0.025, names = FALSE),
+    Q975_Diff_RMSE   = quantile(Diff_RMSE, 0.975, names = FALSE),
+    Pct_Folds_RF_Better = mean(Diff_RMSE > 0) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+print(paired_summary)
+
+p_paired <- ggplot(paired_diff, aes(x = Target, y = Diff_RMSE)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.5, size = 1.2) +
+  labs(title = "Paired Difference per Fold: RMSE Lasso - RMSE Random Forest",
+       subtitle = "> 0 : Random Forest lebih akurat pada fold tersebut",
+       x = "Target", y = "Selisih RMSE")
+print(p_paired)
+```
+
+```{r narasi-paired, include=FALSE}
+pct_rf <- setNames(paired_summary$Pct_Folds_RF_Better, paired_summary$Target)
+md_rf  <- setNames(paired_summary$Mean_Diff_RMSE, paired_summary$Target)
+```
+
+Selisih RMSE berpasangan didefinisikan sebagai RMSE Lasso dikurangi RMSE RF pada lipatan yang sama, sehingga selisih positif berarti RF lebih akurat pada lipatan tersebut. RF lebih akurat daripada Lasso pada `r fmt(pct_rf["Y1"], 1)`% lipatan untuk Y1 (rerata selisih `r fmt(md_rf["Y1"])`) dan pada `r fmt(pct_rf["Y2"], 1)`% lipatan untuk Y2 (rerata selisih `r fmt(md_rf["Y2"])`). Karena lipatan pada validasi silang berulang saling bergantung, interval empiris dari selisih ini bukan uji hipotesis formal. Temuan ini menunjukkan bahwa `r nl_txt`.
+
+### 4.6.8 Permutation Importance RF vs Seleksi Lasso
+
+```{r rf-importance, fig.height=4}
+## 7.6 Permutation importance RF vs seleksi Lasso ----
+# Importance = kenaikan MSE (OOB) ketika nilai satu variabel diacak.
+# Ini ukuran kontribusi PREDIKTIF, bukan bukti signifikansi/kausal.
+rf_importance <- map_dfr(TARGETS, function(t) {
+  imp <- rf_models[[t]]$model$variable.importance
+  tibble(Target = t, Variable = names(imp), Permutation_Importance = unname(imp))
+}) %>%
+  group_by(Target) %>%
+  mutate(
+    Importance_Pct = Permutation_Importance / sum(pmax(Permutation_Importance, 0)) * 100,
+    RF_Rank        = rank(-Permutation_Importance, ties.method = "min")
+  ) %>%
+  ungroup() %>%
+  arrange(Target, RF_Rank)
+print(rf_importance %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
+
+plot_rf_imp <- function(t) {
+  rf_importance %>%
+    filter(Target == t) %>%
+    ggplot(aes(x = reorder(Variable, Permutation_Importance), y = Permutation_Importance)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    coord_flip() +
+    labs(title = paste("RF Permutation Importance -", t),
+         x = NULL, y = "Kenaikan MSE (OOB)")
+}
+print(plot_rf_imp("Y1") | plot_rf_imp("Y2"))
+
+# Tabel pembanding: seleksi Lasso vs peringkat importance RF (level X1-X8)
+lasso_vs_rf <- final_answer %>%
+  select(Variable, Selected_Y1, CV_Selection_Frequency_Y1,
+         Selected_Y2, CV_Selection_Frequency_Y2) %>%
+  left_join(
+    rf_importance %>% filter(Target == "Y1") %>%
+      select(Variable, RF_Importance_Pct_Y1 = Importance_Pct, RF_Rank_Y1 = RF_Rank),
+    by = "Variable"
+  ) %>%
+  left_join(
+    rf_importance %>% filter(Target == "Y2") %>%
+      select(Variable, RF_Importance_Pct_Y2 = Importance_Pct, RF_Rank_Y2 = RF_Rank),
+    by = "Variable"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+print(lasso_vs_rf)
+```
+
+```{r narasi-imp, include=FALSE}
+top_rf <- function(t, k = 3) rf_importance %>% filter(Target == t) %>% arrange(RF_Rank) %>% head(k) %>% pull(Variable)
+```
+
+Menurut *permutation importance*, tiga variabel dengan kontribusi prediktif terbesar pada RF adalah `r lst(top_rf("Y1"))` untuk Y1 dan `r lst(top_rf("Y2"))` untuk Y2. Bandingkan dengan tiga koefisien terbakukan terbesar pada Lasso, yaitu `r lst(top3$Y1)` untuk Y1 dan `r lst(top3$Y2)` untuk Y2. Pada penelitian baseline, Tsanas dan Xifara (2012) menempatkan luas kaca (X7) sebagai peubah terpenting menurut RF. Perbedaan peringkat antara RF dan Lasso wajar terjadi karena RF mengukur kontribusi dengan memperhitungkan hubungan nonlinear dan interaksi, sedangkan koefisien Lasso mengukur kontribusi linear marginal pada skala terbakukan. Selain itu, importance X1, X2, X3, X4, dan X5 pada RF dapat terbagi di antara variabel yang saling berkorelasi kuat, sehingga importance yang rendah pada salah satunya tidak berarti variabel tersebut tidak berpengaruh.
+
+### 4.6.9 Tabel Ringkas Perbandingan Model
+
+```{r rf-model-comparison}
+## 7.7 Tabel ringkas perbandingan model (jawaban benchmark) ----
+model_comparison <- cv_summary_all %>%
+  select(Target, Model, RMSE_Mean, RMSE_SD, MAE_Mean, R2_Mean) %>%
+  left_join(
+    test_results_all %>%
+      select(Target, Model, Test_RMSE = RMSE, Test_MAE = MAE, Test_R2 = R2),
+    by = c("Target", "Model")
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  arrange(Target, Model)
+print(model_comparison)
+
+# Opsional: simpan hasil ke CSV (hapus tanda # jika diperlukan)
+# write_csv(test_results_all, "test_results_all.csv")
+# write_csv(cv_summary_all,   "cv_summary_all.csv")
+# write_csv(paired_summary,   "paired_lasso_vs_rf.csv")
+# write_csv(lasso_vs_rf,      "lasso_vs_rf_importance.csv")
+# write_csv(model_comparison, "model_comparison.csv")
+```
+
+Tabel di atas merangkum kinerja ketiga model pada validasi silang berulang (RMSE rerata, simpangan baku RMSE, MAE rerata, dan $R^2$ rerata) beserta kinerja pada data uji.
+
+### 4.6.10 Catatan Interpretasi: Inferensi vs Akurasi Prediktif
+
+Lasso adalah model linear terpenalti sehingga koefisiennya bertanda dan *sparse*, serta dapat dijelaskan dalam bentuk "kenaikan satu simpangan baku pada prediktor mengubah respons sebesar sekian satuan, *ceteris paribus*". Seleksinya dibaca dari koefisien tidak nol dan frekuensi seleksi pada validasi silang. RF adalah model nonparametrik yang menangkap ketaklinearan dan interaksi, tetapi tidak menghasilkan koefisien, arah efek, maupun *p-value*. Importance RF hanya menunjukkan seberapa besar variabel dipakai untuk prediksi.
+
+Oleh karena itu, pernyataan seperti "X5 paling signifikan karena importance RF tertinggi" dihindari. Pernyataan yang tepat adalah bahwa RF menghasilkan RMSE validasi silang rerata sekian dibanding Lasso, RF lebih akurat pada sekian persen lipatan sehingga terdapat struktur nonlinear yang tidak tertangkap model linear, dan Lasso tetap dipakai untuk interpretasi karena memberikan model *sparse* dengan arah efek yang jelas. Kesimpulan "RF lebih baik secara keseluruhan" juga tidak ditarik hanya dari satu pembagian data uji, melainkan dari validasi silang berulang dan selisih berpasangan.
+
+# BAB V KESIMPULAN
+
+## 5.1 Kesimpulan
+
+Berdasarkan hasil analisis pada data *Energy Efficiency* (`r nrow(df)` observasi, 8 prediktor, 2 respons) dengan *Random Forest* sebagai model baseline, diperoleh kesimpulan sebagai berikut.
+
+1.  Karakteristik data. Data lengkap tanpa nilai hilang (`r sum(quality$missing)` nilai hilang). Prediktor bersifat diskret dengan sedikit nilai unik sehingga X6 dan X8 diperlakukan sebagai kategorik, sedangkan Y1 dan Y2 tidak berdistribusi normal. Prediktor numerik dengan korelasi peringkat terkuat adalah `r top_y1` terhadap Y1 dan `r top_y2` terhadap Y2.
+2.  Multikolinearitas dan diagnostik. Terdapat multikolinearitas sempurna yang bersumber dari identitas geometri $X_2 = X_3 + 2X_4$. Matriks desain memiliki rank `r matrix_rank` dari `r n_columns` kolom dan *condition number* `r fmtp(condition_number)`, dengan `r n_vif10` kolom yang memiliki VIF di atas 10. Uji Breusch-Pagan dan Jarque-Bera pada model OLS masing-masing menunjukkan `r ifelse(all(ds$Breusch_Pagan_p < 0.05), "heteroskedastisitas", "tidak ada bukti heteroskedastisitas")` dan `r ifelse(all(ds$Jarque_Bera_p < 0.05), "residual yang tidak normal", "tidak ada bukti ketidaknormalan residual")` pada kedua respons, sehingga inferensi klasik OLS tidak layak dan penilaian model dilakukan melalui kinerja prediksi di luar sampel.
+3.  Seleksi variabel. Regresi Lasso dengan $\lambda$ hasil validasi silang mampu menangani multikolinearitas sempurna dan melakukan seleksi variabel. Variabel yang terpilih untuk Y1 adalah `r lst(sel_var_y1)` dan untuk Y2 adalah `r lst(sel_var_y2)`, dengan variabel yang selalu terpilih pada seluruh 50 lipatan luar adalah `r lst(always$Y1)` (Y1) dan `r lst(always$Y2)` (Y2). Tereliminasinya suatu variabel dibaca sebagai pemilihan perwakilan informasi pada kondisi kolinear, bukan sebagai ketiadaan pengaruh.
+4.  Kinerja prediksi terhadap baseline. Pada validasi silang berulang, RMSE rerata Lasso adalah `r fmt(cvm("Y1", "Lasso", "RMSE_Mean"))` (Y1) dan `r fmt(cvm("Y2", "Lasso", "RMSE_Mean"))` (Y2), sedangkan baseline RF `r fmt(cvm("Y1", "Random Forest", "RMSE_Mean"))` dan `r fmt(cvm("Y2", "Random Forest", "RMSE_Mean"))`. RF lebih akurat daripada Lasso pada `r fmt(pct_rf["Y1"], 1)`% (Y1) dan `r fmt(pct_rf["Y2"], 1)`% (Y2) lipatan, sehingga `r nl_txt`. Lasso tetap bernilai untuk seleksi dan interpretasi karena menghasilkan model *sparse* dengan arah efek yang jelas.
+
+## 5.2 Saran
+
+1.  Untuk meningkatkan akurasi model yang dapat diinterpretasi, dapat dicoba perluasan model Lasso dengan suku interaksi dan polinomial (misalnya Lasso pada basis fungsi yang diperluas), atau model nonlinear lain seperti *gradient boosting*, dengan RF tetap sebagai baseline.
+2.  Stabilitas seleksi variabel dapat diperkuat dengan *bootstrap* atau *stability selection*, terutama untuk variabel yang frekuensi seleksinya tidak mencapai 100%.
+3.  Metode yang menangani kelompok prediktor berkorelasi tinggi dengan lebih baik, seperti *elastic net* (Zou & Hastie, 2005), dapat dibandingkan dengan Lasso untuk memperoleh seleksi yang lebih stabil.
+4.  Pemodelan kedua respons yang berkorelasi sangat tinggi dapat dilakukan secara simultan menggunakan pendekatan regresi multirespons.
+5.  Interpretasi koefisien dan importance pada data ini perlu dilakukan dengan hati-hati karena kolinearitas struktural, dan kesimpulan terbatas pada data simulasi bangunan hunian dengan volume tetap pada kondisi iklim yang disimulasikan.
+
+# DAFTAR PUSTAKA
+
+Belsley, D. A., Kuh, E., & Welsch, R. E. (1980). *Regression diagnostics: Identifying influential data and sources of collinearity*. Wiley.
+
+Breiman, L. (2001). Random forests. *Machine Learning, 45*(1), 5--32.
+
+Breusch, T. S., & Pagan, A. R. (1979). A simple test for heteroscedasticity and random coefficient variation. *Econometrica, 47*(5), 1287--1294.
+
+Cook, R. D. (1977). Detection of influential observation in linear regression. *Technometrics, 19*(1), 15--18.
+
+Friedman, J., Hastie, T., & Tibshirani, R. (2010). Regularization paths for generalized linear models via coordinate descent. *Journal of Statistical Software, 33*(1), 1--22.
+
+Hastie, T., Tibshirani, R., & Friedman, J. (2009). *The elements of statistical learning: Data mining, inference, and prediction* (2nd ed.). Springer.
+
+Hoerl, A. E., & Kennard, R. W. (1970). Ridge regression: Biased estimation for nonorthogonal problems. *Technometrics, 12*(1), 55--67.
+
+Jarque, C. M., & Bera, A. K. (1980). Efficient tests for normality, homoscedasticity and serial independence of regression residuals. *Economics Letters, 6*(3), 255--259.
+
+Koenker, R. (1981). A note on studentizing a test for heteroscedasticity. *Journal of Econometrics, 17*(1), 107--112.
+
+Kutner, M. H., Nachtsheim, C. J., Neter, J., & Li, W. (2005). *Applied linear statistical models* (5th ed.). McGraw-Hill/Irwin.
+
+Tibshirani, R. (1996). Regression shrinkage and selection via the lasso. *Journal of the Royal Statistical Society: Series B, 58*(1), 267--288.
+
+Tsanas, A., & Xifara, A. (2012). Accurate quantitative estimation of energy performance of residential buildings using statistical machine learning tools. *Energy and Buildings, 49*, 560--567.
+
+Wright, M. N., & Ziegler, A. (2017). ranger: A fast implementation of random forests for high dimensional data in C++ and R. *Journal of Statistical Software, 77*(1), 1--17.
+
+Zou, H., & Hastie, T. (2005). Regularization and variable selection via the elastic net. *Journal of the Royal Statistical Society: Series B, 67*(2), 301--320.
