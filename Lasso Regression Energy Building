@@ -1,0 +1,1013 @@
+# =============================================================================
+# Energy Efficiency - Lasso & Mixture Lasso Regression untuk Heating Load (Y1)
+# dan Cooling Load (Y2) yang BERDISTRIBUSI BIMODAL
+# Versi RStudio, Langkah 2 sampai Langkah 6 (satu skrip utuh)
+#
+# Prinsip analisis
+# - Unit data: konfigurasi desain bangunan hasil simulasi Ecotect (768 observasi).
+# - Y1 (Heating Load) dan Y2 (Cooling Load) dimodelkan SECARA TERPISAH.
+# - Kandidat prediktor: X1 sampai X8. Y1 tidak dipakai memprediksi Y2 (dan sebaliknya).
+# - X6 (orientation) dan X8 (glazing area distribution) diperlakukan sebagai kategorik.
+# - Hubungan X2 = X3 + 2*X4 dipertahankan sebagai masalah multikolinearitas,
+#   bukan alasan menghapus X2 sebelum Lasso.
+# - Koefisien Lasso != 0 berarti "terpilih oleh model", bukan "signifikan (p-value)".
+#
+# PENYESUAIAN UNTUK DATA BIMODAL (dibanding skrip sebelumnya)
+# 1. Langkah 3: diagnosis bimodalitas (dip test, Mclust, bimodality coefficient,
+#    jumlah puncak densitas) + pengecekan apakah bimodalitas dijelaskan X5 dkk.
+# 2. Split train/test dan fold CV DISTRATIFIKASI menurut Y, agar kedua puncak
+#    terwakili di training maupun test.
+# 3. Langkah 4: selain OLS dan Lasso, ditambah MIXTURE LASSO
+#    Y | X ~ sum_k pi_k(X) N(x'b_k, s_k^2) dengan EM; K dipilih lewat BIC.
+#    Seleksi variabel Lasso dilakukan per komponen (rezim).
+# 4. Langkah 5: diagnostik residual juga mencakup uji unimodalitas residual dan
+#    residual kuantil-acak (PIT) untuk mixture.
+# 5. Langkah 6: evaluasi tambahan berupa coverage interval prediksi 90% (asumsi
+#    normal tunggal vs mixture), karena error satu-Gaussian tidak cocok untuk
+#    response bimodal.
+# =============================================================================
+
+
+# Langkah 2 - Rumusan Pertanyaan ----------------------------------------------
+# Variabel desain arsitektural manakah, di antara X1 sampai X8, yang tetap
+# terpilih oleh Lasso (koefisien tidak sama dengan nol) saat memprediksi
+# Heating Load (Y1) dan Cooling Load (Y2) secara terpisah, dan apakah
+# bimodalitas kedua response perlu dimodelkan sebagai campuran dua rezim?
+
+
+# Persiapan Library dan Data --------------------------------------------------
+
+# Jalankan SEKALI saja jika paket belum terpasang:
+# install.packages(c("tidyverse", "readxl", "glmnet", "lmtest", "patchwork",
+#                    "diptest", "mclust"))
+
+suppressPackageStartupMessages({
+  library(tidyverse)   # dplyr, tidyr, ggplot2, purrr, tibble
+  library(readxl)      # membaca file .xlsx
+  library(glmnet)      # Lasso (pengganti LassoCV sklearn)
+  library(lmtest)      # uji Breusch-Pagan
+  library(patchwork)   # menggabungkan beberapa grafik ggplot
+  library(diptest)     # Hartigan's dip test (uji unimodalitas)
+  library(mclust)      # mixture normal univariat (BIC jumlah komponen)
+})
+
+theme_set(theme_bw(base_size = 12))
+options(width = 160, tibble.width = Inf, tibble.print_max = Inf)
+
+# Gunakan garis miring "/" (atau "\\") pada path Windows di R
+FILE_PATH <- "C:/Users/USER/Downloads/energy+efficiency/ENB2012_data.xlsx"
+df <- read_excel(FILE_PATH, sheet = 1)
+
+cat("Shape:", nrow(df), "x", ncol(df), "\n")
+print(head(df))
+
+
+# Definisi Variabel -----------------------------------------------------------
+
+FEATURES             <- c("X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8")
+TARGETS              <- c("Y1", "Y2")
+NUMERIC_FEATURES     <- c("X1", "X2", "X3", "X4", "X5", "X7")
+CATEGORICAL_FEATURES <- c("X6", "X8")
+
+variable_info <- tibble(
+  Variable = c(FEATURES, TARGETS),
+  Description = c(
+    "Relative Compactness", "Surface Area", "Wall Area", "Roof Area",
+    "Overall Height", "Orientation", "Glazing Area", "Glazing Area Distribution",
+    "Heating Load", "Cooling Load"
+  ),
+  Role = c(rep("Predictor", 8), rep("Response", 2))
+)
+print(variable_info)
+
+
+# Langkah 3 - EDA Terarah -----------------------------------------------------
+# Fokus: kualitas data, distribusi Y1 dan Y2 (bimodalitas), hubungan
+# prediktor-response, indikasi non-linearitas, dan multikolinearitas struktural.
+
+## Kualitas data ----
+vars <- c(FEATURES, TARGETS)
+
+quality <- tibble(
+  Variable = vars,
+  dtype    = vapply(df[vars], function(x) class(x)[1], character(1), USE.NAMES = FALSE),
+  missing  = vapply(df[vars], function(x) sum(is.na(x)), numeric(1), USE.NAMES = FALSE),
+  n_unique = vapply(df[vars], function(x) n_distinct(x), numeric(1), USE.NAMES = FALSE)
+)
+print(quality)
+
+cat("Duplicate rows:", sum(duplicated(df)), "\n")
+
+# Ringkasan statistik (setara df.describe().T di pandas)
+describe_tbl <- function(data) {
+  q <- function(p) vapply(data, function(x) quantile(x, p, na.rm = TRUE, names = FALSE), numeric(1), USE.NAMES = FALSE)
+  tibble(
+    Variable = names(data),
+    count    = vapply(data, function(x) sum(!is.na(x)), numeric(1), USE.NAMES = FALSE),
+    mean     = vapply(data, mean, numeric(1), na.rm = TRUE, USE.NAMES = FALSE),
+    std      = vapply(data, sd,   numeric(1), na.rm = TRUE, USE.NAMES = FALSE),
+    min      = vapply(data, min,  numeric(1), na.rm = TRUE, USE.NAMES = FALSE),
+    `25%`    = q(0.25),
+    `50%`    = q(0.50),
+    `75%`    = q(0.75),
+    max      = vapply(data, max,  numeric(1), na.rm = TRUE, USE.NAMES = FALSE)
+  )
+}
+print(describe_tbl(df[vars]))
+
+## Hubungan struktural X2, X3, dan X4 ----
+# X2 = X3 + 2*X4 -> multikolinearitas sempurna pada regresi linear tanpa penalti.
+dependency <- df$X2 - (df$X3 + 2 * df$X4)
+cat("Maximum absolute difference X2 - (X3 + 2*X4):", max(abs(dependency)), "\n")
+
+## Distribusi Y1 dan Y2 ----
+plot_dist <- function(target) {
+  p1 <- ggplot(df, aes(x = .data[[target]])) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30,
+                   fill = "steelblue", alpha = 0.6, color = "white") +
+    geom_density(linewidth = 1) +
+    labs(title = paste("Distribution of", target), x = target, y = "Density")
+  
+  p2 <- ggplot(df, aes(x = .data[[target]])) +
+    geom_boxplot(fill = "steelblue", alpha = 0.6) +
+    labs(title = paste("Boxplot of", target), x = target) +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  
+  p1 | p2
+}
+print(plot_dist("Y1") / plot_dist("Y2"))
+print(describe_tbl(df[TARGETS]))
+
+## Diagnosis bimodalitas Y1 dan Y2 ----
+# - Modes     : jumlah puncak lokal pada estimasi densitas kernel
+# - Dip test  : H0 = unimodal; p kecil -> bukti multimodal
+# - BC        : bimodality coefficient; > 0.555 mengindikasikan bimodal/multimodal
+# - Mclust    : jumlah komponen normal terbaik menurut BIC
+count_modes <- function(x, adjust = 1) {
+  d <- density(x, adjust = adjust)
+  sum(diff(sign(diff(d$y))) == -2)
+}
+
+bimodality_coef <- function(x) {
+  n <- length(x); m <- x - mean(x)
+  g <- mean(m^3) / mean(m^2)^1.5
+  k <- mean(m^4) / mean(m^2)^2 - 3
+  (g^2 + 1) / (k + 3 * (n - 1)^2 / ((n - 2) * (n - 3)))
+}
+
+bimodality_tbl <- map_dfr(TARGETS, function(t) {
+  y  <- df[[t]]
+  dp <- dip.test(y)
+  mc <- Mclust(y, G = 1:4, verbose = FALSE)
+  tibble(
+    Target    = t,
+    Modes     = count_modes(y),
+    Dip_stat  = unname(dp$statistic),
+    Dip_p     = dp$p.value,
+    BC        = bimodality_coef(y),
+    Mclust_G  = mc$G,
+    Mclust_means = paste(round(sort(mc$parameters$mean), 2), collapse = " | ")
+  )
+})
+print(bimodality_tbl)
+
+## Sumber bimodalitas: apakah X tertentu (mis. X5) memisahkan kedua puncak? ----
+# Jika Y sudah unimodal DI DALAM tiap level prediktor diskret, bimodalitas
+# marginal sebagian besar berasal dari prediktor tersebut (mixture of
+# subpopulasi yang teramati). Mixture regression tetap berguna bila setelah X
+# dimasukkan, residual masih multimodal (lihat Langkah 5).
+within_x5 <- map_dfr(TARGETS, function(t) {
+  df %>%
+    group_by(X5) %>%
+    summarise(Target = t, n = n(), Mean = mean(.data[[t]]), SD = sd(.data[[t]]),
+              Modes = count_modes(.data[[t]]),
+              Dip_p = dip.test(.data[[t]])$p.value, .groups = "drop")
+})
+print(within_x5)
+
+plot_by_x5 <- function(target) {
+  ggplot(df, aes(x = .data[[target]], fill = factor(X5))) +
+    geom_histogram(bins = 40, alpha = 0.7, position = "identity", color = "white") +
+    labs(title = paste(target, "menurut X5 (Overall Height)"), x = target, fill = "X5")
+}
+print(plot_by_x5("Y1") | plot_by_x5("Y2"))
+
+## Korelasi rank Spearman ----
+# Korelasi kecil tidak berarti prediktor tidak penting jika hubungannya non-linear.
+spearman_cols <- c("X1", "X2", "X3", "X4", "X5", "X7", "Y1", "Y2")
+spearman_corr <- cor(df[spearman_cols], method = "spearman")
+
+spearman_long <- as.data.frame(as.table(spearman_corr)) %>%
+  setNames(c("Var1", "Var2", "rho"))
+
+p_heat <- ggplot(spearman_long, aes(x = Var1, y = Var2, fill = rho)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", rho)), size = 3.5) +
+  scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#B40426",
+                       midpoint = 0, limits = c(-1, 1)) +
+  scale_x_discrete(limits = spearman_cols) +
+  scale_y_discrete(limits = rev(spearman_cols)) +
+  coord_fixed() +
+  labs(title = "Spearman Rank Correlation", x = NULL, y = NULL)
+print(p_heat)
+
+print(round(spearman_corr[c("X1", "X2", "X3", "X4", "X5", "X7"), c("Y1", "Y2")], 4))
+
+## Fokus X7 (Glazing Area) dan potensi non-linearitas ----
+# Kurva LOWESS (setara seaborn regplot lowess=True).
+plot_lowess <- function(target) {
+  lw <- lowess(df$X7, df[[target]], f = 2/3, iter = 3, delta = 0)
+  ggplot(df, aes(x = X7, y = .data[[target]])) +
+    geom_point(alpha = 0.35) +
+    geom_line(data = tibble(X7 = lw$x, fit = lw$y), aes(x = X7, y = fit),
+              inherit.aes = FALSE, color = "firebrick", linewidth = 1) +
+    labs(title = paste("LOWESS: X7 vs", target))
+}
+print(plot_lowess("Y1") | plot_lowess("Y2"))
+
+## Prediktor kategorik terhadap Y1 dan Y2 ----
+box_cat <- function(x, y, title) {
+  ggplot(df, aes(x = factor(.data[[x]]), y = .data[[y]])) +
+    geom_boxplot(fill = "steelblue", alpha = 0.6) +
+    labs(title = title, x = x, y = y)
+}
+print(
+  (box_cat("X6", "Y1", "Y1 by Orientation (X6)") | box_cat("X8", "Y1", "Y1 by Glazing Distribution (X8)")) /
+    (box_cat("X6", "Y2", "Y2 by Orientation (X6)") | box_cat("X8", "Y2", "Y2 by Glazing Distribution (X8)"))
+)
+
+
+# Langkah 4 - Fit Lasso, Mixture Lasso, dan Baseline --------------------------
+# Tiga keluarga model per response:
+#   1. Multiple Linear Regression (baseline)
+#   2. Lasso, lambda dipilih dengan cross-validation (satu garis regresi)
+#   3. Mixture Lasso (K rezim; EM; K dipilih BIC; Lasso per komponen)
+# Preprocessing:
+#   - X1, X2, X3, X4, X5, X7 distandardisasi (mean 0, sd populasi 1)
+#   - X6 dan X8 di-one-hot encode (kategori pertama sebagai referensi)
+#
+# Catatan: glmnet dengan standardize = FALSE memiliki fungsi objektif yang sama
+# dengan sklearn Lasso, yaitu (1/(2n))*RSS + alpha*|beta|_1, sehingga "lambda"
+# di glmnet setara dengan "alpha" di sklearn.
+
+## Split train/test TERSTRATIFIKASI (kedua puncak Y harus ada di train & test) ----
+# Stratifikasi memakai rata-rata peringkat Y1 dan Y2 (keduanya sangat berkorelasi).
+strat_folds <- function(key, k) {
+  n <- length(key); ord <- order(key, runif(n)); f <- integer(n)
+  blocks <- ceiling(seq_len(n) / k)
+  for (b in unique(blocks)) {
+    idx <- which(blocks == b)
+    f[ord[idx]] <- sample(k, length(idx))
+  }
+  f
+}
+strat_key <- (rank(df$Y1) + rank(df$Y2)) / 2
+
+set.seed(42)
+n_obs    <- nrow(df)
+test_idx <- which(strat_folds(strat_key, 5) == 1)     # sekitar 20% test
+
+X_train <- df[-test_idx, FEATURES];  X_test <- df[test_idx, FEATURES]
+Y_train <- df[-test_idx, TARGETS];   Y_test <- df[test_idx, TARGETS]
+
+cat("X_train:", nrow(X_train), "x", ncol(X_train), "\n")
+cat("X_test :", nrow(X_test),  "x", ncol(X_test),  "\n")
+
+## Preprocessing (dipelajari HANYA dari data training) ----
+fit_prep <- function(X) {
+  sc <- vapply(X[NUMERIC_FEATURES], function(v) sqrt(mean((v - mean(v))^2)), numeric(1))
+  sc[sc == 0] <- 1
+  list(
+    center = vapply(X[NUMERIC_FEATURES], mean, numeric(1)),
+    scale  = sc,
+    levels = lapply(X[CATEGORICAL_FEATURES], function(v) sort(unique(v)))
+  )
+}
+
+apply_prep <- function(prep, X) {
+  # numerik: standardisasi
+  num <- do.call(cbind, lapply(NUMERIC_FEATURES, function(v) {
+    (X[[v]] - prep$center[[v]]) / prep$scale[[v]]
+  }))
+  colnames(num) <- NUMERIC_FEATURES
+  
+  # kategorik: one-hot, drop = "first"; level tak dikenal -> semua dummy 0
+  cat_list <- lapply(CATEGORICAL_FEATURES, function(v) {
+    lv <- prep$levels[[v]][-1]
+    m  <- matrix(vapply(lv, function(l) as.numeric(X[[v]] == l), numeric(nrow(X))),
+                 nrow = nrow(X), ncol = length(lv))
+    colnames(m) <- paste0(v, "_", lv)
+    m
+  })
+  
+  cbind(num, do.call(cbind, cat_list))
+}
+
+## Mixture Lasso: EM dengan komponen regresi Gaussian ber-penalti Lasso ----
+# Model: Y | X ~ sum_k pi_k(X) N(b0_k + x'b_k, s_k^2)
+# E-step : responsibility w_ik proporsional dengan pi_k * N(y_i; mu_ik, s_k)
+# M-step : Lasso berbobot w_ik per komponen (lambda tetap = lambda.min Lasso global),
+#          s_k dan pi_k diperbarui dari bobot.
+# K dipilih dengan BIC, df = jumlah koefisien nonzero + intercept + sigma + (K-1).
+# Setelah K terpilih: lambda per komponen dipilih ulang dengan cv.glmnet berbobot,
+# dan pi_k(X) dipelajari dengan multinomial Lasso agar data baru bisa diprediksi.
+K_MAX        <- 3       # jumlah komponen maksimum yang dicoba
+N_START      <- 3       # inisialisasi acak EM per K
+EM_MAX_ITER  <- 100
+EM_TOL       <- 1e-6
+MIN_PROP     <- 0.05    # komponen dengan bobot < 5% dianggap runtuh (inisialisasi dibuang)
+
+wlasso <- function(Z, y, w, lambda) {
+  keep <- w > 1e-8
+  fit <- suppressWarnings(glmnet(Z[keep, , drop = FALSE], y[keep], weights = w[keep],
+                                 alpha = 1, lambda = lambda, standardize = FALSE,
+                                 thresh = 1e-10, maxit = 1e6))
+  as.numeric(as.matrix(coef(fit, s = lambda)))       # intercept diikuti koefisien
+}
+
+em_mixture <- function(Z, y, K, lambda, n_start = N_START) {
+  n <- length(y); best <- NULL
+  sig_floor <- 0.01 * sd(y)
+  for (s in seq_len(n_start)) {
+    # inisialisasi responsibility: k-means pada y (s > 1: y diberi jitter)
+    if (K == 1) {
+      w <- matrix(1, n, 1)
+    } else {
+      yy <- if (s == 1) y else y + rnorm(n, 0, 0.3 * sd(y))
+      cl <- kmeans(yy, centers = K, nstart = 1)$cluster
+      w  <- matrix(0.05 / (K - 1), n, K)
+      w[cbind(seq_len(n), cl)] <- 0.95
+    }
+    ll_old <- -Inf; ok <- TRUE; ll <- -Inf
+    for (it in seq_len(EM_MAX_ITER)) {
+      pi_k <- colMeans(w)
+      if (any(pi_k < MIN_PROP)) { ok <- FALSE; break }
+      B  <- sapply(seq_len(K), function(j) wlasso(Z, y, w[, j], lambda))   # (p+1) x K
+      MU <- cbind(1, Z) %*% B
+      sg <- pmax(sqrt(colSums(w * (y - MU)^2) / colSums(w)), sig_floor)
+      logd <- sapply(seq_len(K), function(j) log(pi_k[j]) + dnorm(y, MU[, j], sg[j], log = TRUE))
+      logd <- matrix(logd, nrow = n, ncol = K)
+      m    <- apply(logd, 1, max)
+      lse  <- m + log(rowSums(exp(logd - m)))
+      ll   <- sum(lse)
+      w    <- exp(logd - lse)
+      if (abs(ll - ll_old) < EM_TOL * (abs(ll) + 1)) break
+      ll_old <- ll
+    }
+    if (!ok || !is.finite(ll)) next
+    df_par <- sum(abs(B[-1, ]) > 1e-10) + K + K + (K - 1)
+    bic    <- -2 * ll + log(n) * df_par
+    if (is.null(best) || bic < best$bic) {
+      best <- list(K = K, ll = ll, bic = bic, B = B, sigma = sg, w = w)
+    }
+  }
+  best
+}
+
+fit_mixture_target <- function(X_tr, y_tr, lambda_ref, seed = 42) {
+  set.seed(seed)
+  prep <- fit_prep(X_tr)
+  Z    <- apply_prep(prep, X_tr)
+  n    <- length(y_tr)
+  
+  # pilih K dengan BIC
+  cand <- lapply(seq_len(K_MAX), function(K) em_mixture(Z, y_tr, K, lambda_ref))
+  bics <- vapply(cand, function(f) if (is.null(f)) NA_real_ else f$bic, numeric(1))
+  names(bics) <- seq_len(K_MAX)
+  K_best <- as.integer(names(which.min(bics)))
+  em     <- cand[[K_best]]
+  K      <- K_best
+  
+  # urutkan komponen menurut rata-rata Y (komponen 1 = puncak terendah)
+  comp_mean <- colSums(em$w * y_tr) / colSums(em$w)
+  ord <- order(comp_mean)
+  post <- em$w[, ord, drop = FALSE]
+  
+  # refit Lasso berbobot per komponen dengan lambda hasil CV
+  B <- matrix(0, ncol(Z) + 1, K, dimnames = list(c("(Intercept)", colnames(Z)), NULL))
+  for (j in seq_len(K)) {
+    idx <- which(post[, j] > 1e-3)
+    foldid <- sample(rep(seq_len(5), length.out = length(idx)))
+    cvj <- cv.glmnet(Z[idx, , drop = FALSE], y_tr[idx], weights = post[idx, j],
+                     alpha = 1, lambda = LAMBDA_GRID, foldid = foldid,
+                     standardize = FALSE, thresh = 1e-10, maxit = 1e6)
+    B[, j] <- as.numeric(as.matrix(coef(cvj, s = "lambda.min")))
+  }
+  MU    <- cbind(1, Z) %*% B
+  sigma <- pmax(sqrt(colSums(post * (y_tr - MU)^2) / colSums(post)), 0.01 * sd(y_tr))
+  hard  <- max.col(post)
+  
+  # pi_k(X): multinomial Lasso pada label komponen (hard assignment)
+  member <- NULL
+  if (K > 1) {
+    member <- cv.glmnet(Z, factor(hard, levels = seq_len(K)), family = "multinomial",
+                        alpha = 1, nfolds = 5, type.measure = "class", standardize = FALSE)
+  }
+  
+  list(prep = prep, K = K, B = B, sigma = sigma, weight = colMeans(post),
+       post = post, hard = hard, member = member, bic = bics)
+}
+
+mix_parts <- function(mm, X_new) {
+  Z  <- apply_prep(mm$prep, X_new)
+  MU <- cbind(1, Z) %*% mm$B
+  PI <- if (mm$K == 1) {
+    matrix(1, nrow(Z), 1)
+  } else {
+    matrix(predict(mm$member, newx = Z, s = "lambda.min", type = "response"), nrow = nrow(Z))
+  }
+  list(MU = MU, PI = PI)
+}
+
+# Prediksi mixture:
+#   soft : E[Y|x] = sum_k pi_k(x) mu_k(x)   (meminimalkan MSE)
+#   hard : mu_k*(x), k* = argmax pi_k(x)    (mempertahankan struktur dua puncak)
+predict_mixture <- function(mm, X_new, type = c("soft", "hard")) {
+  type <- match.arg(type)
+  pr <- mix_parts(mm, X_new)
+  if (type == "soft") rowSums(pr$PI * pr$MU) else pr$MU[cbind(seq_len(nrow(pr$MU)), max.col(pr$PI))]
+}
+
+# Interval prediksi equal-tailed dari mixture (kuantil CDF campuran pada grid)
+mixture_interval <- function(mm, X_new, level = 0.90, ngrid = 800) {
+  pr <- mix_parts(mm, X_new); n <- nrow(pr$MU)
+  grid <- seq(min(pr$MU) - 4 * max(mm$sigma), max(pr$MU) + 4 * max(mm$sigma), length.out = ngrid)
+  cdf <- matrix(0, n, ngrid)
+  for (k in seq_len(mm$K)) {
+    cdf <- cdf + pr$PI[, k] * pnorm((matrix(grid, n, ngrid, byrow = TRUE) - pr$MU[, k]) / mm$sigma[k])
+  }
+  a <- (1 - level) / 2
+  cbind(lo = apply(cdf, 1, function(r) grid[which(r >= a)[1]]),
+        hi = apply(cdf, 1, function(r) grid[which(r >= 1 - a)[1]]))
+}
+
+# PIT: u_i = F(y_i | x_i) dari CDF campuran. Jika model benar, u ~ Uniform(0,1).
+mixture_pit <- function(mm, X_new, y) {
+  pr <- mix_parts(mm, X_new); n <- nrow(pr$MU)
+  Ym <- matrix(y, n, mm$K)
+  Sm <- matrix(mm$sigma, n, mm$K, byrow = TRUE)
+  rowSums(pr$PI * pnorm((Ym - pr$MU) / Sm))
+}
+
+## Fungsi fit model (OLS + LassoCV + Mixture Lasso) untuk SATU response ----
+LAMBDA_GRID <- 10^seq(2, -4, length.out = 200)   # setara np.logspace(-4, 2, 200), urut menurun
+INNER_FOLDS <- 5
+
+fit_target_models <- function(X_tr, y_tr, seed = 42) {
+  prep <- fit_prep(X_tr)
+  Z    <- apply_prep(prep, X_tr)
+  
+  # Baseline: regresi linear (pada rank-deficient, lm memberi NA pada koefisien yang teralias)
+  baseline <- lm(y ~ ., data = data.frame(y = y_tr, Z, check.names = FALSE))
+  
+  # Lasso dengan inner 5-fold CV; alpha optimal = lambda dengan MSE CV minimum
+  set.seed(seed)
+  foldid <- sample(rep(seq_len(INNER_FOLDS), length.out = nrow(Z)))
+  lasso <- cv.glmnet(
+    x = Z, y = y_tr, alpha = 1, lambda = LAMBDA_GRID, foldid = foldid,
+    standardize = FALSE, thresh = 1e-10, maxit = 1e6
+  )
+  
+  # Mixture Lasso (lambda acuan = lambda.min Lasso global)
+  mixture <- fit_mixture_target(X_tr, y_tr, lambda_ref = lasso$lambda.min, seed = seed)
+  
+  list(prep = prep, baseline = baseline, lasso = lasso, mixture = mixture)
+}
+
+MODEL_NAMES <- c("Linear Regression", "Lasso", "Mixture Lasso (soft)", "Mixture Lasso (hard)")
+
+predict_model <- function(fit, model_name, X_new) {
+  if (model_name == "Linear Regression") {
+    Z <- apply_prep(fit$prep, X_new)
+    # peringatan "rank-deficient fit" diharapkan (X2 = X3 + 2*X4); prediksi tetap valid
+    suppressWarnings(as.numeric(predict(fit$baseline, newdata = data.frame(Z, check.names = FALSE))))
+  } else if (model_name == "Lasso") {
+    Z <- apply_prep(fit$prep, X_new)
+    as.numeric(predict(fit$lasso, newx = Z, s = "lambda.min"))
+  } else {
+    predict_mixture(fit$mixture, X_new, if (grepl("soft", model_name)) "soft" else "hard")
+  }
+}
+
+## Fit model untuk Y1 dan Y2 secara terpisah ----
+fitted_models <- setNames(
+  lapply(TARGETS, function(t) fit_target_models(X_train, Y_train[[t]])),
+  TARGETS
+)
+
+for (t in TARGETS) {
+  mm <- fitted_models[[t]]$mixture
+  cat("\n==", t, "==\n")
+  cat("Optimal alpha (Lasso)  :", fitted_models[[t]]$lasso$lambda.min, "\n")
+  cat("BIC mixture per K      :", paste(names(mm$bic), round(mm$bic, 1), sep = "=", collapse = " | "), "\n")
+  cat("K terpilih (BIC)       :", mm$K, "\n")
+  cat("Bobot komponen         :", round(mm$weight, 3), "\n")
+  cat("Sigma komponen         :", round(mm$sigma, 3), "\n")
+}
+
+## Koefisien Lasso pada level fitur hasil encoding ----
+lasso_coef_table <- function(fit) {
+  b <- as.matrix(coef(fit$lasso, s = "lambda.min"))
+  b <- b[rownames(b) != "(Intercept)", 1]
+  tibble(
+    Feature     = names(b),
+    Coefficient = unname(b),
+    Selected    = abs(unname(b)) > 1e-10
+  )
+}
+
+lasso_feature_tables <- list()
+for (t in TARGETS) {
+  lasso_feature_tables[[t]] <- lasso_coef_table(fitted_models[[t]]) %>%
+    arrange(desc(abs(Coefficient)))
+  cat("\n", t, " (Lasso tunggal)\n", sep = "")
+  print(lasso_feature_tables[[t]])
+}
+
+## Koefisien Mixture Lasso per komponen ----
+mixture_coef_table <- function(mm) {
+  map_dfr(seq_len(mm$K), function(j) {
+    b <- mm$B[-1, j]
+    tibble(Component = j, Weight = mm$weight[j], Sigma = mm$sigma[j],
+           Intercept = mm$B[1, j], Feature = names(b),
+           Coefficient = unname(b), Selected = abs(unname(b)) > 1e-10)
+  })
+}
+
+for (t in TARGETS) {
+  cat("\n", t, " (Mixture Lasso per komponen; komponen 1 = rata-rata Y terendah)\n", sep = "")
+  print(mixture_coef_table(fitted_models[[t]]$mixture) %>%
+          arrange(Component, desc(abs(Coefficient))))
+}
+
+## Seleksi dikembalikan ke level variabel asli X1-X8 ----
+# Variabel kategorik dianggap terpilih jika minimal satu dummy-nya bukan nol.
+original_variable <- function(feature_name) sub("_.*$", "", feature_name)   # "X6_3" -> "X6"
+
+summarise_selection <- function(coef_table) {
+  coef_table %>%
+    mutate(Variable = original_variable(Feature)) %>%
+    group_by(Variable) %>%
+    summarise(
+      Nonzero_Encoded_Terms = sum(Selected),
+      Max_Abs_Coefficient   = max(abs(Coefficient)),
+      .groups = "drop"
+    ) %>%
+    mutate(Selected = Nonzero_Encoded_Terms > 0) %>%
+    arrange(match(Variable, FEATURES)) %>%
+    select(Variable, Selected, Max_Abs_Coefficient, Nonzero_Encoded_Terms)
+}
+
+# Mixture: terpilih jika nonzero pada SETIDAKNYA satu komponen
+mixture_any_table <- function(mm) {
+  mixture_coef_table(mm) %>%
+    group_by(Feature) %>%
+    summarise(Coefficient = Coefficient[which.max(abs(Coefficient))],
+              Selected = any(Selected), .groups = "drop")
+}
+
+selection_tables <- lapply(lasso_feature_tables, summarise_selection)
+
+selection_summary <- inner_join(
+  selection_tables[["Y1"]], selection_tables[["Y2"]],
+  by = "Variable", suffix = c("_Y1", "_Y2")
+)
+print(selection_summary)
+
+# Seleksi per komponen pada level variabel asli
+mixture_selection <- map_dfr(TARGETS, function(t) {
+  mixture_coef_table(fitted_models[[t]]$mixture) %>%
+    mutate(Variable = original_variable(Feature)) %>%
+    group_by(Component, Variable) %>%
+    summarise(Selected = any(Selected), Max_Abs_Coefficient = max(abs(Coefficient)),
+              .groups = "drop") %>%
+    mutate(Target = t)
+}) %>%
+  select(Target, Component, Variable, Selected, Max_Abs_Coefficient) %>%
+  arrange(Target, Component, match(Variable, FEATURES))
+print(mixture_selection)
+
+# Profil komponen: rata-rata X asli dan Y per komponen (interpretasi "rezim desain")
+for (t in TARGETS) {
+  mm <- fitted_models[[t]]$mixture
+  prof <- bind_cols(X_train, Y = Y_train[[t]], Component = factor(mm$hard)) %>%
+    group_by(Component) %>%
+    summarise(n = n(), across(c(X1, X2, X3, X4, X5, X7, Y), mean), .groups = "drop")
+  cat("\nProfil komponen", t, "\n"); print(prof)
+}
+
+p_comp <- map(TARGETS, function(t) {
+  mm <- fitted_models[[t]]$mixture
+  ggplot(tibble(y = Y_train[[t]], Component = factor(mm$hard)), aes(x = y, fill = Component)) +
+    geom_histogram(bins = 40, alpha = 0.7, position = "identity", color = "white") +
+    labs(title = paste(t, "- komponen Mixture Lasso (training)"), x = t)
+})
+print(p_comp[[1]] | p_comp[[2]])
+
+
+# Langkah 5 - Diagnostic Model ------------------------------------------------
+# Diagnostic OLS: residual dan Cook's Distance memiliki interpretasi klasik pada
+# OLS. Inferensi koefisien OLS harus dibaca hati-hati karena ada multikolinearitas
+# sempurna di antara X2, X3, dan X4. Pada data bimodal, ditambahkan:
+#   - uji unimodalitas residual OLS (jika masih multimodal, satu Gaussian tidak cukup)
+#   - residual kuantil-acak (PIT) untuk Mixture Lasso
+
+## Design matrix OLS + cek rank ----
+prep_for_ols   <- fit_prep(X_train)
+X_train_design <- apply_prep(prep_for_ols, X_train)
+X_train_const  <- cbind(const = 1, X_train_design)
+
+sv               <- svd(X_train_const)$d
+matrix_rank      <- sum(sv > max(dim(X_train_const)) * max(sv) * .Machine$double.eps)
+n_columns        <- ncol(X_train_const)
+condition_number <- max(sv) / min(sv)
+
+cat("Jumlah kolom design matrix :", n_columns, "\n")
+cat("Rank design matrix         :", matrix_rank, "\n")
+cat("Rank deficient?            :", matrix_rank < n_columns, "\n")
+cat("Condition number           :", condition_number, "\n")
+
+## VIF ----
+# VIF sangat besar / Inf adalah konsekuensi dependensi linear sempurna.
+# Dihitung manual: VIF_j = 1 / (1 - R2_j), R2_j dari regresi kolom j pada kolom lain.
+vif_one <- function(j, M) {
+  y   <- M[, j]
+  fit <- lm(y ~ M[, -j, drop = FALSE])
+  r2  <- 1 - sum(residuals(fit)^2) / sum((y - mean(y))^2)
+  1 / (1 - r2)
+}
+
+vif_table <- tibble(
+  Variable = colnames(X_train_design),
+  VIF      = vapply(seq_len(ncol(X_train_design)), vif_one, numeric(1), M = X_train_design)
+) %>%
+  arrange(desc(VIF))
+print(vif_table)
+
+## Residual dan influential observations untuk Y1 dan Y2 ----
+jarque_bera_p <- function(x) {
+  n  <- length(x)
+  m  <- x - mean(x)
+  m2 <- mean(m^2); m3 <- mean(m^3); m4 <- mean(m^4)
+  S  <- m3 / m2^1.5
+  K  <- m4 / m2^2
+  JB <- n / 6 * (S^2 + (K - 3)^2 / 4)
+  pchisq(JB, df = 2, lower.tail = FALSE)
+}
+
+ols_models      <- list()
+diagnostic_rows <- list()
+cook_threshold  <- 4 / nrow(X_train)
+
+for (t in TARGETS) {
+  m <- lm(y ~ ., data = data.frame(y = Y_train[[t]], X_train_design, check.names = FALSE))
+  ols_models[[t]] <- m
+  
+  res     <- residuals(m)
+  bp      <- bptest(m, studentize = TRUE)      # Breusch-Pagan (Koenker)
+  cooks_d <- cooks.distance(m)
+  
+  diagnostic_rows[[t]] <- tibble(
+    Target          = t,
+    R2_OLS          = summary(m)$r.squared,
+    Breusch_Pagan_p = unname(bp$p.value),
+    Jarque_Bera_p   = jarque_bera_p(res),
+    Dip_p_Resid     = dip.test(res)$p.value,     # p kecil -> residual masih multimodal
+    Modes_Resid     = count_modes(res, adjust = 1.5),
+    Cook_Threshold  = cook_threshold,
+    N_Influential   = sum(cooks_d > cook_threshold)
+  )
+}
+diagnostic_summary <- bind_rows(diagnostic_rows)
+print(diagnostic_summary)
+
+# Residual vs Fitted dan Q-Q plot
+plot_resid <- function(m, t) {
+  ggplot(tibble(fitted = fitted(m), resid = residuals(m)), aes(x = fitted, y = resid)) +
+    geom_point(alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = paste("Residual vs Fitted -", t), x = "Fitted values", y = "Residuals")
+}
+
+plot_qq <- function(m, t) {
+  r <- residuals(m)
+  ggplot(tibble(z = (r - mean(r)) / sd(r)), aes(sample = z)) +
+    stat_qq() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = paste("Q-Q Plot -", t), x = "Theoretical Quantiles", y = "Sample Quantiles")
+}
+
+print(
+  (plot_resid(ols_models$Y1, "Y1") | plot_qq(ols_models$Y1, "Y1")) /
+    (plot_resid(ols_models$Y2, "Y2") | plot_qq(ols_models$Y2, "Y2"))
+)
+
+# Histogram residual OLS (bimodal residual terlihat langsung di sini)
+plot_resid_hist <- function(m, t) {
+  ggplot(tibble(r = residuals(m)), aes(x = r)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30,
+                   fill = "steelblue", alpha = 0.6, color = "white") +
+    geom_density(linewidth = 1) +
+    labs(title = paste("Histogram residual OLS -", t), x = "Residual")
+}
+print(plot_resid_hist(ols_models$Y1, "Y1") | plot_resid_hist(ols_models$Y2, "Y2"))
+
+# Cook's Distance
+plot_cook <- function(m, t) {
+  cd <- as.numeric(cooks.distance(m))
+  ggplot(tibble(obs = seq_along(cd) - 1, cooks = cd), aes(x = obs, y = cooks)) +
+    geom_segment(aes(xend = obs, yend = 0)) +
+    geom_point(size = 0.6) +
+    geom_hline(yintercept = cook_threshold, linetype = "dashed", color = "red") +
+    annotate("text", x = Inf, y = cook_threshold, label = "4/n",
+             hjust = 1.1, vjust = -0.6, color = "red") +
+    labs(title = paste("Cook's Distance -", t),
+         x = "Training Observation", y = "Cook's Distance")
+}
+print(plot_cook(ols_models$Y1, "Y1") / plot_cook(ols_models$Y2, "Y2"))
+
+## Diagnostik Mixture Lasso: residual kuantil-acak (PIT) ----
+# u = F_mixture(y | x) harus ~ Uniform(0,1); r = qnorm(u) harus ~ N(0,1) bila
+# mixture cocok. (Evaluasi in-sample pada training; bersifat indikatif.)
+pit_summary <- map_dfr(TARGETS, function(t) {
+  u <- mixture_pit(fitted_models[[t]]$mixture, X_train, Y_train[[t]])
+  r <- qnorm(pmin(pmax(u, 1e-6), 1 - 1e-6))
+  tibble(Target = t, K = fitted_models[[t]]$mixture$K,
+         KS_Uniform_p = ks.test(u, "punif")$p.value,
+         Resid_Mean = mean(r), Resid_SD = sd(r),
+         Dip_p_Resid = dip.test(r)$p.value)
+})
+print(pit_summary)
+
+plot_pit_qq <- function(t) {
+  u <- mixture_pit(fitted_models[[t]]$mixture, X_train, Y_train[[t]])
+  r <- qnorm(pmin(pmax(u, 1e-6), 1 - 1e-6))
+  ggplot(tibble(r = r), aes(sample = r)) + stat_qq() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = paste("Q-Q residual kuantil Mixture -", t),
+         x = "Theoretical Quantiles", y = "Sample Quantiles")
+}
+print(plot_pit_qq("Y1") | plot_pit_qq("Y2"))
+
+
+# Langkah 6 - Train/Test, Cross-Validation, Inferensi vs Prediksi -------------
+# Prediksi: RMSE, MAE, R2 pada test set dan repeated cross-validation.
+# Inferensi: p-value OLS TIDAK dipakai untuk menyebut variabel "benar-benar penting"
+# karena rank deficiency. Untuk Lasso/Mixture Lasso: koefisien nonzero, konsistensi
+# seleksi pada repeated CV, dan performa out-of-sample.
+
+metric_rmse <- function(y, p) sqrt(mean((y - p)^2))
+metric_mae  <- function(y, p) mean(abs(y - p))
+metric_r2   <- function(y, p) 1 - sum((y - p)^2) / sum((y - mean(y))^2)
+
+## Evaluasi test set ----
+test_results <- map_dfr(TARGETS, function(t) {
+  map_dfr(MODEL_NAMES, function(mn) {
+    pred <- predict_model(fitted_models[[t]], mn, X_test)
+    tibble(
+      Target = t, Model = mn,
+      RMSE = metric_rmse(Y_test[[t]], pred),
+      MAE  = metric_mae(Y_test[[t]], pred),
+      R2   = metric_r2(Y_test[[t]], pred)
+    )
+  })
+})
+print(test_results)
+
+## Actual vs Predicted ----
+plot_avp <- function(t, mn) {
+  d <- tibble(Actual = Y_test[[t]], Predicted = predict_model(fitted_models[[t]], mn, X_test))
+  ggplot(d, aes(x = Actual, y = Predicted)) +
+    geom_point(alpha = 0.65) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = paste(t, "-", mn))
+}
+print(
+  wrap_plots(c(lapply(MODEL_NAMES, function(mn) plot_avp("Y1", mn)),
+               lapply(MODEL_NAMES, function(mn) plot_avp("Y2", mn))), ncol = 2)
+)
+
+## Interval prediksi 90%: satu Gaussian (OLS/Lasso) vs Mixture ----
+# Untuk response bimodal, interval Gaussian tunggal cenderung terlalu lebar di
+# lembah antara dua puncak. Bandingkan coverage empiris dan lebar rata-rata.
+interval_results <- map_dfr(TARGETS, function(t) {
+  fit <- fitted_models[[t]]; y <- Y_test[[t]]; z <- qnorm(0.95)
+  gauss <- map_dfr(c("Linear Regression", "Lasso"), function(mn) {
+    sd_tr <- sd(Y_train[[t]] - predict_model(fit, mn, X_train))
+    p <- predict_model(fit, mn, X_test)
+    tibble(Target = t, Model = paste(mn, "(Gaussian)"),
+           Coverage = mean(y >= p - z * sd_tr & y <= p + z * sd_tr),
+           Mean_Width = 2 * z * sd_tr)
+  })
+  iv <- mixture_interval(fit$mixture, X_test, 0.90)
+  bind_rows(gauss, tibble(Target = t, Model = "Mixture Lasso (mixture quantile)",
+                          Coverage = mean(y >= iv[, "lo"] & y <= iv[, "hi"]),
+                          Mean_Width = mean(iv[, "hi"] - iv[, "lo"])))
+})
+print(interval_results)   # target coverage = 0.90
+
+## Repeated cross-validation ----
+# 10-fold CV x 5 repeats (outer), fold DISTRATIFIKASI menurut Y. Di setiap outer
+# training fold, lambda Lasso dan K mixture dipilih ulang tanpa memakai validation
+# fold. Sekaligus mencatat variabel terpilih dan K yang terpilih di tiap fold.
+# Waktu komputasi lebih lama dari skrip sebelumnya (mixture); kecilkan N_REPEATS
+# atau N_SPLITS bila perlu.
+N_SPLITS  <- 10
+N_REPEATS <- 5
+
+cv_rows           <- list()
+selection_records <- list()
+mix_sel_records   <- list()
+k_records         <- list()
+
+for (rep_id in seq_len(N_REPEATS)) {
+  set.seed(42 + rep_id)
+  fold_assign <- strat_folds(strat_key, N_SPLITS)
+  
+  for (k in seq_len(N_SPLITS)) {
+    tr      <- which(fold_assign != k)
+    te      <- which(fold_assign == k)
+    X_tr    <- df[tr, FEATURES]
+    X_te    <- df[te, FEATURES]
+    fold_no <- (rep_id - 1) * N_SPLITS + k
+    
+    for (t in TARGETS) {
+      y_tr <- df[[t]][tr]
+      y_te <- df[[t]][te]
+      fit  <- fit_target_models(X_tr, y_tr, seed = 1000 * rep_id + k)
+      
+      for (mn in MODEL_NAMES) {
+        pred <- predict_model(fit, mn, X_te)
+        cv_rows[[length(cv_rows) + 1]] <- tibble(
+          Target = t, Model = mn, Repeat = rep_id, Fold = fold_no,
+          RMSE = metric_rmse(y_te, pred),
+          MAE  = metric_mae(y_te, pred),
+          R2   = metric_r2(y_te, pred)
+        )
+      }
+      
+      selection_records[[length(selection_records) + 1]] <-
+        lasso_coef_table(fit) %>%
+        summarise_selection() %>%
+        mutate(Target = t, Fold = fold_no)
+      
+      mix_sel_records[[length(mix_sel_records) + 1]] <-
+        mixture_any_table(fit$mixture) %>%
+        summarise_selection() %>%
+        mutate(Target = t, Fold = fold_no)
+      
+      k_records[[length(k_records) + 1]] <- tibble(Target = t, Fold = fold_no, K = fit$mixture$K)
+    }
+  }
+  cat("Repeated CV: repeat", rep_id, "dari", N_REPEATS, "selesai\n")
+}
+
+cv_results <- bind_rows(cv_rows)
+print(head(cv_results))
+
+## Ringkasan ketidakpastian performa ----
+# Q025-Q975 = 95% empirical interval dari hasil resampling (bukan CI inferensial klasik).
+cv_summary <- cv_results %>%
+  group_by(Target, Model) %>%
+  summarise(
+    RMSE_Mean = mean(RMSE),
+    RMSE_SD   = sd(RMSE),
+    RMSE_Q025 = quantile(RMSE, 0.025, names = FALSE),
+    RMSE_Q975 = quantile(RMSE, 0.975, names = FALSE),
+    MAE_Mean  = mean(MAE),
+    MAE_SD    = sd(MAE),
+    R2_Mean   = mean(R2),
+    R2_SD     = sd(R2),
+    R2_Q025   = quantile(R2, 0.025, names = FALSE),
+    R2_Q975   = quantile(R2, 0.975, names = FALSE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+print(cv_summary)
+
+p_cv <- cv_results %>%
+  pivot_longer(c(RMSE, MAE, R2), names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(Metric, levels = c("RMSE", "MAE", "R2"))) %>%
+  ggplot(aes(x = Target, y = Value, fill = Model)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(title = "Repeated CV (10-fold x 5 repeats, stratified)", y = NULL)
+print(p_cv)
+
+## Jumlah komponen K yang terpilih di outer folds ----
+cat("\nFrekuensi K terpilih (BIC) pada outer folds:\n")
+print(bind_rows(k_records) %>% count(Target, K))
+
+## Stabilitas seleksi Lasso dan Mixture Lasso pada outer folds ----
+# Selection frequency: 100% = selalu terpilih di seluruh outer folds;
+# nilai lebih rendah = seleksi lebih sensitif terhadap sampel training.
+# Mixture: variabel dihitung terpilih bila nonzero pada >= 1 komponen (label
+# komponen antar-fold tidak dibandingkan langsung).
+selection_stability <- bind_rows(selection_records) %>%
+  group_by(Target, Variable) %>%
+  summarise(
+    Selection_Frequency        = mean(Selected) * 100,
+    Median_Max_Abs_Coefficient = median(Max_Abs_Coefficient),
+    .groups = "drop"
+  ) %>%
+  arrange(Target, desc(Selection_Frequency))
+
+mix_selection_stability <- bind_rows(mix_sel_records) %>%
+  group_by(Target, Variable) %>%
+  summarise(
+    Selection_Frequency        = mean(Selected) * 100,
+    Median_Max_Abs_Coefficient = median(Max_Abs_Coefficient),
+    .groups = "drop"
+  ) %>%
+  arrange(Target, desc(Selection_Frequency))
+
+cat("\nStabilitas seleksi - Lasso tunggal\n")
+print(selection_stability %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
+cat("\nStabilitas seleksi - Mixture Lasso\n")
+print(mix_selection_stability %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
+
+## Tabel jawaban utama ----
+mix_selection_summary <- map(TARGETS, function(t) {
+  summarise_selection(mixture_any_table(fitted_models[[t]]$mixture))
+})
+names(mix_selection_summary) <- TARGETS
+
+final_answer <- selection_summary %>%
+  select(Variable, Selected_Y1, Max_Abs_Coefficient_Y1, Selected_Y2, Max_Abs_Coefficient_Y2) %>%
+  left_join(
+    selection_stability %>% filter(Target == "Y1") %>%
+      select(Variable, CV_Selection_Frequency_Y1 = Selection_Frequency),
+    by = "Variable"
+  ) %>%
+  left_join(
+    selection_stability %>% filter(Target == "Y2") %>%
+      select(Variable, CV_Selection_Frequency_Y2 = Selection_Frequency),
+    by = "Variable"
+  ) %>%
+  left_join(
+    mix_selection_summary[["Y1"]] %>% select(Variable, Mixture_Selected_Y1 = Selected),
+    by = "Variable"
+  ) %>%
+  left_join(
+    mix_selection_summary[["Y2"]] %>% select(Variable, Mixture_Selected_Y2 = Selected),
+    by = "Variable"
+  ) %>%
+  left_join(
+    mix_selection_stability %>% filter(Target == "Y1") %>%
+      select(Variable, Mixture_CV_Freq_Y1 = Selection_Frequency),
+    by = "Variable"
+  ) %>%
+  left_join(
+    mix_selection_stability %>% filter(Target == "Y2") %>%
+      select(Variable, Mixture_CV_Freq_Y2 = Selection_Frequency),
+    by = "Variable"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+print(final_answer)
+
+# Opsional: simpan hasil ke CSV (hapus tanda # jika diperlukan)
+# write_csv(final_answer,         "final_answer.csv")
+# write_csv(cv_summary,           "cv_summary.csv")
+# write_csv(test_results,         "test_results.csv")
+# write_csv(interval_results,     "interval_results.csv")
+# write_csv(mixture_selection,    "mixture_selection.csv")
+
+
+# Panduan Menjawab Pertanyaan Project -----------------------------------------
+# Bimodalitas:
+#   - Laporkan `bimodality_tbl` (dip test, BC, Mclust) dan `within_x5`. Jika Y
+#     unimodal di dalam tiap level X5 dan residual OLS (Dip_p_Resid) tidak
+#     signifikan, bimodalitas berasal dari prediktor teramati, dan Lasso tunggal
+#     sudah memadai. Mixture hanya dibenarkan bila residual masih multimodal
+#     atau metrik CV/interval membaik berarti.
+# Temuan utama: gunakan `final_answer`.
+#   BENAR : "X7 dipertahankan oleh Lasso pada model final Y1 dan muncul pada ...%
+#            outer folds, sehingga seleksinya relatif stabil."
+#   HINDARI: "X7 signifikan pada alpha = 5%." (koefisien nonzero Lasso bukan p-value)
+#
+# Mixture Lasso:
+#   - K dipilih BIC; komponen = rezim statistik pada data simulasi, bukan
+#     "kelompok nyata" tanpa dukungan substantif. Label komponen diurutkan
+#     menurut rata-rata Y (1 = terendah).
+#   - Prediksi soft biasanya unggul di RMSE; prediksi hard mempertahankan dua
+#     puncak tetapi berisiko salah komponen.
+#   - Jika performa CV Mixture dan Lasso serupa, jangan menyebut mixture
+#     "lebih baik" hanya karena lebih kompleks; gunakan `interval_results` untuk
+#     menilai apakah ketidakpastian prediksi lebih jujur.
+#
+# Inferensi vs prediksi:
+#   - OLS membantu membaca residual dan menunjukkan masalah inferensial akibat
+#     multikolinearitas, dan residualnya menunjukkan sisa bimodalitas.
+#   - Lasso/Mixture Lasso lebih relevan untuk seleksi dan prediksi saat prediktor
+#     berkorelasi.
+#
+# Uncertainty: mean dan SD repeated-CV, 95% empirical interval, selection
+# frequency tiap X, frekuensi K terpilih, coverage interval prediksi.
+#
+# Keterbatasan: kesimpulan hanya berlaku pada ruang konfigurasi simulasi dataset
+# (bukan pengukuran bangunan nyata; volume, iklim/lokasi, material, okupansi tetap;
+# hubungan X-Y dapat non-linear). EM dapat terjebak optimum lokal (karena itu
+# N_START > 1), hasil sensitif terhadap K_MAX/MIN_PROP, dan lambda mixture awal
+# memakai lambda Lasso global. Temuan adalah hasil model linear terpenalti pada
+# ruang desain simulasi ini, bukan bukti kausal universal.
